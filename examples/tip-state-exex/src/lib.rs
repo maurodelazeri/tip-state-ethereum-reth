@@ -1,8 +1,8 @@
 //! Flat normalization of Reth canonical-chain state and fail-closed producer integration.
 //!
 //! This crate validates block-aligned hashed flat deltas, maps them to the wire schema, constructs
-//! a pinned seed, durably frames transitions, and coordinates exact acknowledgements from every
-//! mandatory replica.
+//! a pinned seed, durably frames transitions, and coordinates the exact cohort acknowledgement
+//! through the mandatory local fanout.
 
 pub mod coordinator;
 pub mod producer_io;

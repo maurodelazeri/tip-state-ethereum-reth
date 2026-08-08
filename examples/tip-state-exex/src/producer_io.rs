@@ -1,4 +1,4 @@
-//! Mandatory Unix-socket transport and fsynced producer outbox.
+//! Mandatory local-fanout Unix-socket transport and fsynced producer outbox.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -21,7 +21,7 @@ use tokio::{
     time::timeout,
 };
 
-/// One mandatory replica connection. Transport loss is always returned as an error.
+/// One mandatory local fanout connection. Transport loss is always returned as an error.
 #[derive(Debug)]
 pub struct ReplicaConnection {
     stream: UnixStream,
@@ -30,8 +30,9 @@ pub struct ReplicaConnection {
 }
 
 impl ReplicaConnection {
-    /// Connects to one replica, sends the exact seed request, and awaits its completed-generation
-    /// ACK. The caller must compare generation IDs across every mandatory fan-out destination.
+    /// Connects to the mandatory local fanout, sends the exact seed request, and awaits its
+    /// completed-generation cohort ACK. The fanout compares generation IDs across every active
+    /// destination before returning it.
     pub async fn connect_and_seed(
         socket: &Path,
         request: &SeedRequest,
@@ -113,7 +114,7 @@ impl DurableOutbox {
         Ok(path)
     }
 
-    /// Atomically advances the durable ACK checkpoint after every mandatory replica ACK matches.
+    /// Atomically advances the durable ACK checkpoint after the fanout's exact cohort ACK matches.
     pub fn persist_ack(&self, ack: &TransitionAck) -> eyre::Result<()> {
         let encoded =
             serde_json::to_vec(&AckCheckpoint { format: "tip-state-producer-ack-v1", ack })?;

@@ -20,7 +20,8 @@ use crate::wire::map_seed_header;
 /// This must run inside the awaited ExEx initializer, before pipeline or engine progression can
 /// write a later state. The returned MDBX transaction ID is checked by every replica read
 /// transaction during its scan. Dropping the short provider transaction before the scan is safe
-/// only because node progression remains gated until all mandatory replicas ACK the seed.
+/// only because node progression remains gated until the mandatory local fanout confirms that
+/// every active cohort member acknowledged the seed.
 pub fn capture_seed_request<P>(
     provider: &P,
     evm_config: &EthEvmConfig,
