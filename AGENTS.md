@@ -1,6 +1,7 @@
 # Tip-State Producer Constraints
 
 - This checkout is the repaired Reth 2.3 producer for the flat, current-tip runtime.
+- Read `TIP_STATE_FORK.md` before changing the fork. Preserve its upstream base tag and provenance.
 - The intended product branch is `main`; preserve the existing upstream Reth source unless a
   producer change explicitly requires it.
 - Custom producer code lives under `examples/tip-state-exex/` and `crates/tip-state-wire/`, plus
