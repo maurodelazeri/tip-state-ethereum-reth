@@ -5,12 +5,14 @@ the canonical seed and ordered live stream; it is not part of the runtime servin
 
 ## Upstream provenance
 
+- Tip-state fork repository: `https://github.com/maurodelazeri/tip-state-ethereum-reth`
+- Paired runtime repository: `https://github.com/maurodelazeri/tip-state-ethereum-runtime`
 - Official upstream: `https://github.com/paradigmxyz/reth.git`
 - Upstream release and workspace version: `v2.3.0`
 - Fork-point commit: `9384bc53d8c0c77e59cac83fdaaf3b372c6d2216`
 - Fork-point tree: `fd24663d6d1f39e082091121ec20cdac3adc83e3`
 - Annotated base tag: `tipstate-upstream-reth-v2.3.0`
-- Paired runtime repository: sibling `../runtime`
+- Local paired runtime: sibling `../runtime`
 
 The exact fork point must be recorded explicitly. Never infer it only from a crate version or a
 moving upstream branch.
@@ -50,3 +52,7 @@ For every producer-client upgrade:
    restart qualification before deployment.
 
 Do not rebase away or move an already qualified base tag.
+
+The fork origin retains only `main` and the explicit `tipstate-upstream-*` provenance tags.
+Official upstream branches and release tags remain available through the separate `upstream`
+remote and are not duplicated on this origin.

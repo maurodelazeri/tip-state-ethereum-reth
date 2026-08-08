@@ -1,5 +1,7 @@
 # Tip-State Producer Constraints
 
+- Canonical fork repository: `https://github.com/maurodelazeri/tip-state-ethereum-reth`;
+  official Reth is the separate `upstream` remote.
 - This checkout is the repaired Reth 2.3 producer for the flat, current-tip runtime.
 - Read `TIP_STATE_FORK.md` before changing the fork. Preserve its upstream base tag and provenance.
 - The intended product branch is `main`; preserve the existing upstream Reth source unless a
