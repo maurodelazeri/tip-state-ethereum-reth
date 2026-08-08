@@ -3827,6 +3827,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-tip-state-exex"
+version = "0.0.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "eyre",
+ "futures-util",
+ "reth-db",
+ "reth-db-api",
+ "reth-ethereum",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-execution-types",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-storage-api",
+ "reth-trie-common",
+ "revm",
+ "revm-database",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tip-state-wire",
+ "tokio",
+]
+
+[[package]]
 name = "example-txpool-tracing"
 version = "0.0.0"
 dependencies = [
@@ -12226,6 +12255,17 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tip-state-wire"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "sha3 0.10.8",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "tokio"

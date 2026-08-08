@@ -75,7 +75,7 @@ impl<Node: FullNodeComponents + Clone> ExExLauncher<Node> {
 
         if extensions.is_empty() {
             // nothing to launch
-            return Ok(None)
+            return Ok(None);
         }
 
         info!(target: "reth::cli", "Loading ExEx Write-Ahead Log...");
@@ -160,11 +160,21 @@ impl<Node: FullNodeComponents + Clone> ExExLauncher<Node> {
         components.task_executor().spawn_critical_task(
             "exex manager blockchain tree notifications",
             async move {
-                while let Ok(notification) = canon_state_notifications.recv().await {
-                    handle
-                        .send_async(ExExNotificationSource::BlockchainTree, notification.into())
-                        .await
-                        .expect("blockchain tree notification could not be sent to exex manager");
+                loop {
+                    match canon_state_notifications.recv().await {
+                        Ok(notification) => {
+                            handle
+                                .send_async(
+                                    ExExNotificationSource::BlockchainTree,
+                                    notification.into(),
+                                )
+                                .await
+                                .expect(
+                                    "blockchain tree notification could not be sent to exex manager",
+                                );
+                        }
+                        Err(error) => panic_on_canonical_notification_error(error),
+                    }
                 }
             },
         );
@@ -184,5 +194,36 @@ impl<Node: FullNodeComponents> Debug for ExExLauncher<Node> {
             .field("config_container", &self.config_container)
             .field("wal_blocks_warning", &self.wal_blocks_warning)
             .finish()
+    }
+}
+
+fn panic_on_canonical_notification_error(error: tokio::sync::broadcast::error::RecvError) -> ! {
+    match error {
+        tokio::sync::broadcast::error::RecvError::Lagged(skipped) => {
+            panic!("canonical ExEx notification gap: receiver lagged by {skipped} notifications")
+        }
+        tokio::sync::broadcast::error::RecvError::Closed => {
+            panic!("canonical ExEx notification channel closed")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panic_on_canonical_notification_error;
+    use tokio::sync::broadcast::error::RecvError;
+
+    #[test]
+    #[should_panic(
+        expected = "canonical ExEx notification gap: receiver lagged by 7 notifications"
+    )]
+    fn canonical_notification_lag_is_fatal() {
+        panic_on_canonical_notification_error(RecvError::Lagged(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "canonical ExEx notification channel closed")]
+    fn canonical_notification_closure_is_fatal() {
+        panic_on_canonical_notification_error(RecvError::Closed);
     }
 }
