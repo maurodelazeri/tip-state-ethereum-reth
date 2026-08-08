@@ -23,6 +23,7 @@ pub struct ProducerCoordinator {
     sequence: u64,
     history: VecDeque<BlockDescriptor>,
     history_limit: usize,
+    seed_recent_block_hashes: RecentBlockHashes,
     recent_block_hashes: RecentBlockHashes,
     in_flight: Option<InFlightTransition>,
 }
@@ -77,6 +78,7 @@ impl ProducerCoordinator {
             stream,
             history: descriptor_history.into(),
             history_limit,
+            seed_recent_block_hashes: seed_recent_block_hashes.clone(),
             recent_block_hashes: seed_recent_block_hashes,
             in_flight: None,
         })
@@ -280,7 +282,11 @@ impl ProducerCoordinator {
             .checked_sub(self.recent_block_hashes.start_number)
             .and_then(|offset| usize::try_from(offset).ok())
             .and_then(|offset| self.recent_block_hashes.hashes.get(offset).copied());
-        from_history.or(from_window)
+        let from_seed_window = number
+            .checked_sub(self.seed_recent_block_hashes.start_number)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| self.seed_recent_block_hashes.hashes.get(offset).copied());
+        from_history.or(from_window).or(from_seed_window)
     }
 }
 
@@ -369,9 +375,9 @@ fn validate_seed_descriptor_history(
         return Err(WireError::ZeroHistoryLimit.into());
     }
     stream.validate()?;
-    if history.is_empty()
-        || history.len() > history_limit
-        || history.last() != Some(&stream.seed_anchor)
+    if history.is_empty() ||
+        history.len() > history_limit ||
+        history.last() != Some(&stream.seed_anchor)
     {
         return Err(CoordinatorError::InvalidSeedDescriptorHistory);
     }
@@ -383,10 +389,10 @@ fn validate_seed_descriptor_history(
     for pair in history.windows(2) {
         let expected_number =
             pair[0].identity.number.checked_add(1).ok_or(WireError::BlockNumberOverflow)?;
-        if pair[1].identity.number != expected_number
-            || pair[1].identity.parent_hash != pair[0].identity.hash
-            || pair[1].execution.timestamp <= pair[0].execution.timestamp
-            || pair[1].execution.active_fork < pair[0].execution.active_fork
+        if pair[1].identity.number != expected_number ||
+            pair[1].identity.parent_hash != pair[0].identity.hash ||
+            pair[1].execution.timestamp <= pair[0].execution.timestamp ||
+            pair[1].execution.active_fork < pair[0].execution.active_fork
         {
             return Err(CoordinatorError::InvalidSeedDescriptorHistory);
         }
@@ -449,6 +455,8 @@ mod tests {
     use tip_state_wire::{BlockExecutionContext, ExecutionFork, StateChange, FRAME_MAGIC};
 
     const SEED_SEQUENCE: u64 = 41;
+    const EPOCH6_SEED_NUMBER: u64 = 25_709_072;
+    const EPOCH6_REORG_NUMBER: u64 = 25_709_268;
 
     fn hash(tag: u64) -> Hash32 {
         let mut hash = [0u8; 32];
@@ -520,6 +528,23 @@ mod tests {
         coordinator.accept_ack(&prepared.expected_ack()).unwrap();
     }
 
+    fn full_window_seed_inputs() -> (StreamIdentity, RecentBlockHashes, BlockDescriptor) {
+        let start_number = EPOCH6_SEED_NUMBER - BLOCKHASH_WINDOW as u64;
+        let recent = RecentBlockHashes {
+            start_number,
+            hashes: (start_number..EPOCH6_SEED_NUMBER).map(hash).collect(),
+        };
+        let seed = block(EPOCH6_SEED_NUMBER, EPOCH6_SEED_NUMBER, *recent.hashes.last().unwrap());
+        let stream = StreamIdentity {
+            chain_id: 1,
+            genesis_hash: hash(9),
+            seed_generation_id: hash(99_999),
+            seed_sequence: SEED_SEQUENCE,
+            seed_anchor: seed.clone(),
+        };
+        (stream, recent, seed)
+    }
+
     #[test]
     fn multi_block_reorg_derives_replacement_blockhash_window() {
         let (mut coordinator, genesis, block_one, seed) = fixture();
@@ -573,6 +598,90 @@ mod tests {
         );
         accept(&mut coordinator, &reverted);
         assert_eq!(coordinator.tip(), &coordinator.stream().seed_anchor);
+    }
+
+    #[test]
+    fn epoch6_depth_one_reorg_recovers_evicted_seed_blockhash() {
+        let (stream, seed_recent, seed) = full_window_seed_inputs();
+        let mut coordinator =
+            ProducerCoordinator::new(stream, seed_recent, vec![seed.clone()]).unwrap();
+        let mut parent = seed;
+        let mut common_ancestor = parent.clone();
+        let mut forward = Vec::new();
+        for number in EPOCH6_SEED_NUMBER + 1..=EPOCH6_REORG_NUMBER {
+            common_ancestor = parent.clone();
+            let next = block(number, number, parent.identity.hash);
+            forward.push(added(next.clone()));
+            parent = next;
+        }
+        let old_tip = parent;
+        let committed = coordinator.prepare_transition(Vec::new(), forward).unwrap();
+        accept(&mut coordinator, &committed);
+        let acknowledged_sequence = coordinator.sequence();
+        let acknowledged_tip = coordinator.tip().clone();
+        let acknowledged_window = coordinator.recent_block_hashes().clone();
+        assert_eq!(acknowledged_tip, old_tip);
+        assert_eq!(acknowledged_window.start_number, 25_709_012);
+        assert!(!acknowledged_window.hashes.contains(&hash(25_709_011)));
+
+        let replacement =
+            block(EPOCH6_REORG_NUMBER, EPOCH6_REORG_NUMBER + 10_000, common_ancestor.identity.hash);
+        let reorg = coordinator
+            .prepare_transition(vec![old_tip.identity], vec![added(replacement.clone())])
+            .unwrap();
+        assert_eq!(reorg.batch().common_ancestor, common_ancestor);
+        assert_eq!(reorg.batch().new_tip, replacement);
+        assert_eq!(reorg.batch().recent_block_hashes, acknowledged_window);
+        assert_eq!(reorg.batch().recent_block_hashes.hashes.len(), BLOCKHASH_WINDOW);
+        assert_eq!(reorg.batch().recent_block_hashes.hashes.first(), Some(&hash(25_709_012)));
+        assert_eq!(
+            reorg.batch().recent_block_hashes.hashes.last(),
+            Some(&common_ancestor.identity.hash)
+        );
+        assert_eq!(coordinator.sequence(), acknowledged_sequence);
+        assert_eq!(coordinator.tip(), &acknowledged_tip);
+        assert_eq!(coordinator.recent_block_hashes(), &acknowledged_window);
+        accept(&mut coordinator, &reorg);
+        assert_eq!(coordinator.sequence(), acknowledged_sequence + 1);
+        assert_eq!(coordinator.tip(), &replacement);
+        assert_eq!(coordinator.recent_block_hashes(), &acknowledged_window);
+    }
+
+    #[test]
+    fn seed_window_fallback_does_not_mask_unavailable_history() {
+        let (stream, seed_recent, seed) = full_window_seed_inputs();
+        let mut coordinator =
+            ProducerCoordinator::with_history_limit(stream, seed_recent, vec![seed.clone()], 2)
+                .unwrap();
+        let mut parent = seed;
+        let mut first_wave = Vec::with_capacity(BLOCKHASH_WINDOW);
+        for number in EPOCH6_SEED_NUMBER + 1..=EPOCH6_SEED_NUMBER + BLOCKHASH_WINDOW as u64 {
+            let next = block(number, number, parent.identity.hash);
+            first_wave.push(added(next.clone()));
+            parent = next;
+        }
+        let committed = coordinator.prepare_transition(Vec::new(), first_wave).unwrap();
+        accept(&mut coordinator, &committed);
+
+        let next =
+            block(parent.identity.number + 1, parent.identity.number + 1, parent.identity.hash);
+        let committed =
+            coordinator.prepare_transition(Vec::new(), vec![added(next.clone())]).unwrap();
+        accept(&mut coordinator, &committed);
+        let acknowledged_sequence = coordinator.sequence();
+        let acknowledged_tip = coordinator.tip().clone();
+        let acknowledged_window = coordinator.recent_block_hashes().clone();
+        assert_eq!(
+            coordinator.prepare_transition(vec![next.identity], Vec::new()),
+            Err(CoordinatorError::BlockHashHistoryUnavailable {
+                tip: parent.identity.number,
+                missing: EPOCH6_SEED_NUMBER,
+            })
+        );
+        assert!(coordinator.in_flight().is_none());
+        assert_eq!(coordinator.sequence(), acknowledged_sequence);
+        assert_eq!(coordinator.tip(), &acknowledged_tip);
+        assert_eq!(coordinator.recent_block_hashes(), &acknowledged_window);
     }
 
     #[test]
