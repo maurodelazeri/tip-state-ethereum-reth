@@ -26,9 +26,11 @@ moving upstream branch.
 3. `710307bc13c1fb6f3c9cace5af3ec7d55265bf5d` centralizes producer documentation and
    comments without changing functional behavior.
 
-The behavioral patch range is
+The pre-bootstrap2 behavioral patch range was
 `9384bc53d8c0c77e59cac83fdaaf3b372c6d2216..5988f9f709daa9415c08afbec333d818ffaae37f`.
-Its functional tree is `372864c03601f1dce408cf1b7544d06020ed3776`.
+Its functional tree was `372864c03601f1dce408cf1b7544d06020ed3776`. The current source additionally
+implements bootstrap2/TIPWIRE2 canonical full-block transport for method 14; record the resulting
+commit and tree with the paired runtime before qualification.
 
 ## Custom source boundary
 
@@ -40,8 +42,46 @@ Its functional tree is `372864c03601f1dce408cf1b7544d06020ed3776`.
   exact build-context policy that build the custom producer executable rather than the upstream
   `reth` binary
 
-Current producer identities are bootstrap schema 1 and `TIPWIRE1`. Keep upstream source outside
+Current producer identities are bootstrap schema 2 and `TIPWIRE2`. Keep upstream source outside
 this boundary unchanged unless an explicit producer requirement makes a narrow change necessary.
+
+## Bootstrap2 and TIPWIRE2 block contract
+
+The producer transports the complete canonical Ethereum block RLP so replicas can answer
+current-tip `eth_getBlockByNumber` without Reth, MDBX, history, or another network service on the
+request path:
+
+- `SeedRequest.anchor_block_rlp` is the exact persisted anchor block encoded from the same
+  read-only MDBX transaction used for the Finish checkpoint, sealed header, snapshot transaction
+  ID, and `BLOCKHASH` window. Bootstrap JSON encodes it as lowercase, even-length, `0x`-prefixed
+  hex.
+- Before reading that anchor or scanning state, the producer reads `Finish`, `Execution`,
+  `AccountHashing`, `StorageHashing`, and `MerkleExecute` from the same read-only provider snapshot.
+  All five must exist and equal the ExEx launch head. Any missing or unequal frontier is fatal and
+  reports all five values; this prevents labeling already-advanced storage-v2 flat state with an
+  older Finish block.
+- Every TIPWIRE2 `AddedBlock.block_rlp` is encoded directly from the canonical notification's
+  `RecoveredBlock` and placed after its descriptor as `u32` big-endian length plus raw bytes,
+  before the state-change count and changes.
+- A block RLP is nonempty and at most 32 MiB. The sum of added-block RLP in one frame is at most
+  48 MiB. The complete TIPWIRE2 frame remains at most 64 MiB. The bounded bootstrap message is at
+  most 65 MiB.
+- Bootstrap schema 2 uses digest domain `tip-state-bootstrap-message-v2`. TIPWIRE2 uses magic
+  `TIPWIRE2`, schema 2, and checksum domain `tip-state-transition-wire-v2`. Schema 1 peers are
+  rejected; producer, proxy, and replicas must move to schema 2 as one coordinated generation.
+- `TIPSEED2` and `TIPCTRL1` are unchanged. They remain downstream proxy/runtime protocols and are
+  not aliases for the producer bootstrap or transition frame.
+
+The receiver must strictly decode the Ethereum block, reject trailing bytes, verify canonical
+byte-identical re-encoding, and bind the decoded header number, hash, parent hash, state root, and
+execution fields to the enclosing descriptor before atomically publishing the generation. The
+transported signed transaction envelopes support both transaction-hash arrays and complete
+transaction objects. A decode, descriptor, body-root, sender-recovery, limit, or version mismatch
+fails the generation closed.
+
+The paired runtime exposes this as method 14, current-tip-only `eth_getBlockByNumber`. Every
+syntactically valid selector maps to the same tip pinned at request admission; there is no history,
+selector lookup, null-on-old-selector behavior, producer fallback, or partial block response.
 
 ## Producer executable and image
 
@@ -96,7 +136,7 @@ producer's required in-container values are explicit and non-secret:
 | --- | --- | --- |
 | `TIP_STATE_REPLICA_SOCKET` | `/data/tip-state.sock` | Mandatory local fan-out connection |
 | `TIP_STATE_OUTBOX_DIR` | `/data/tip-state-outbox` | Fsynced per-generation transition outbox |
-| `TIP_STATE_SEED_TIMEOUT_SECONDS` | `3600` | Awaited whole-seed connection/write/read deadline |
+| `TIP_STATE_SEED_TIMEOUT_SECONDS` | `21600` | Awaited whole-seed connection/write/read deadline, including a cold cloned-volume scan |
 | `TIP_STATE_IO_TIMEOUT_SECONDS` | `30` | Post-seed mandatory live-frame I/O deadline |
 
 The host bind `/mnt/blockchain/snapshot/reth:/data:rw` provides both Reth's datadir and the local
@@ -111,6 +151,9 @@ mandatory replica must be listening, and the proxy must bind the socket before s
 container. A missing socket makes the awaited ExEx initializer fail and shuts down Reth; it is not
 a reason to retry without the mandatory fan-out. Never bypass those host guards with a direct
 `docker start`, and never let Docker's own restart policy auto-start this volume-bound container.
+The proxy and every stateful replica must also use `Restart=no`: any process loss invalidates the
+in-memory cohort and requires a fresh membership epoch and complete reseed, never a same-epoch
+automatic retry.
 
 ### Existing qualified-container warning
 

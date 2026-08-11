@@ -452,7 +452,9 @@ fn advance_block_hash_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tip_state_wire::{BlockExecutionContext, ExecutionFork, StateChange, FRAME_MAGIC};
+    use tip_state_wire::{
+        BlockExecutionContext, CanonicalBlockRlp, ExecutionFork, StateChange, FRAME_MAGIC,
+    };
 
     const SEED_SEQUENCE: u64 = 41;
     const EPOCH6_SEED_NUMBER: u64 = 25_709_072;
@@ -497,7 +499,11 @@ mod tests {
     }
 
     fn added(block: BlockDescriptor) -> AddedBlock {
-        AddedBlock { block, changes: Vec::new() }
+        AddedBlock {
+            block,
+            block_rlp: CanonicalBlockRlp::new(vec![0xc3, 0xc0, 0xc0, 0xc0]),
+            changes: Vec::new(),
+        }
     }
 
     fn fixture() -> (ProducerCoordinator, BlockDescriptor, BlockDescriptor, BlockDescriptor) {

@@ -3,13 +3,14 @@
 use crate::{NormalizedBlock, NormalizedChain};
 use alloy_consensus::Header;
 use alloy_primitives::{keccak256, B256, U256};
-use reth_evm::ConfigureEvm;
+use reth_evm::{ConfigureEvm, EvmEnv};
 use reth_evm_ethereum::EthEvmConfig;
 use revm::primitives::hardfork::SpecId;
 use std::collections::BTreeSet;
 use thiserror::Error;
 use tip_state_wire::{
-    AddedBlock, BlockDescriptor, BlockExecutionContext, BlockIdentity, ExecutionFork, StateChange,
+    AddedBlock, BlockDescriptor, BlockExecutionContext, BlockIdentity, CanonicalBlockRlp,
+    ExecutionFork, StateChange,
 };
 
 /// Converts one normalized, contiguous chain segment into canonically ordered wire additions.
@@ -42,20 +43,14 @@ pub fn map_seed_header(
     sealed_hash: B256,
     evm_config: &EthEvmConfig,
 ) -> Result<BlockDescriptor, WireMappingError> {
-    let block = NormalizedBlock {
-        identity: crate::BlockIdentity {
-            number: header.number,
-            hash: sealed_hash,
-            parent_hash: header.parent_hash,
-            state_root: header.state_root,
-        },
-        header: header.clone(),
-        evm_env: evm_config.evm_env(header).expect("EthEvmConfig::evm_env is infallible"),
-        account_sets: Vec::new(),
-        storage_updates: Vec::new(),
-        account_deletes: Vec::new(),
+    let identity = crate::BlockIdentity {
+        number: header.number,
+        hash: sealed_hash,
+        parent_hash: header.parent_hash,
+        state_root: header.state_root,
     };
-    map_block_descriptor(&block)
+    let evm_env = evm_config.evm_env(header).expect("EthEvmConfig::evm_env is infallible");
+    map_block_descriptor_parts(&identity, header, &evm_env)
 }
 
 /// Maps one revm specification identifier to the wire schema's stable fork identifier.
@@ -118,7 +113,11 @@ fn map_block(
     mut changes: Vec<StateChange>,
 ) -> Result<AddedBlock, WireMappingError> {
     changes.extend(map_state_changes(block)?);
-    Ok(AddedBlock { block: map_block_descriptor(block)?, changes })
+    Ok(AddedBlock {
+        block: map_block_descriptor(block)?,
+        block_rlp: CanonicalBlockRlp::new(block.block_rlp.clone()),
+        changes,
+    })
 }
 
 fn map_code_prelude(chain: &NormalizedChain) -> Result<Vec<StateChange>, WireMappingError> {
@@ -249,15 +248,22 @@ fn reject_duplicate_accounts(
 }
 
 fn map_block_descriptor(block: &NormalizedBlock) -> Result<BlockDescriptor, WireMappingError> {
-    let number = block.identity.number;
-    let header = &block.header;
-    let env = &block.evm_env.block_env;
-    let spec = block.evm_env.cfg_env.spec;
+    map_block_descriptor_parts(&block.identity, &block.header, &block.evm_env)
+}
 
-    require_identity(number, "number", block.identity.number == header.number)?;
-    require_identity(number, "hash", block.identity.hash == header.hash_slow())?;
-    require_identity(number, "parent_hash", block.identity.parent_hash == header.parent_hash)?;
-    require_identity(number, "state_root", block.identity.state_root == header.state_root)?;
+fn map_block_descriptor_parts(
+    identity: &crate::BlockIdentity,
+    header: &Header,
+    evm_env: &EvmEnv<SpecId>,
+) -> Result<BlockDescriptor, WireMappingError> {
+    let number = identity.number;
+    let env = &evm_env.block_env;
+    let spec = evm_env.cfg_env.spec;
+
+    require_identity(number, "number", identity.number == header.number)?;
+    require_identity(number, "hash", identity.hash == header.hash_slow())?;
+    require_identity(number, "parent_hash", identity.parent_hash == header.parent_hash)?;
+    require_identity(number, "state_root", identity.state_root == header.state_root)?;
 
     require_env(number, "number", env.number == U256::from(header.number))?;
     require_env(number, "timestamp", env.timestamp == U256::from(header.timestamp))?;
@@ -294,9 +300,9 @@ fn map_block_descriptor(block: &NormalizedBlock) -> Result<BlockDescriptor, Wire
     Ok(BlockDescriptor {
         identity: BlockIdentity {
             number,
-            hash: block.identity.hash.0,
-            parent_hash: block.identity.parent_hash.0,
-            state_root: block.identity.state_root.0,
+            hash: identity.hash.0,
+            parent_hash: identity.parent_hash.0,
+            state_root: identity.state_root.0,
         },
         execution: BlockExecutionContext {
             active_fork: map_execution_fork(spec),

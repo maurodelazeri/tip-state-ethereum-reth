@@ -25,25 +25,25 @@
 use std::collections::VecDeque;
 
 use blake3::Hasher as Blake3Hasher;
-use serde::{Deserialize, Serialize};
+use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
 pub mod bootstrap;
 
-pub const SCHEMA_VERSION: u16 = 1;
-pub const FRAME_MAGIC: [u8; 8] = *b"TIPWIRE1";
+pub const SCHEMA_VERSION: u16 = 2;
+pub const FRAME_MAGIC: [u8; 8] = *b"TIPWIRE2";
 pub const FRAME_HEADER_BYTES: usize = 16;
 pub const FRAME_CHECKSUM_BYTES: usize = 32;
 const FRAME_FLAGS: u16 = 0;
-const CHECKSUM_DOMAIN: &[u8] = b"tip-state-transition-wire-v1";
+const CHECKSUM_DOMAIN: &[u8] = b"tip-state-transition-wire-v2";
 const BLOCKHASH_WINDOW: usize = 256;
 const BLOCK_IDENTITY_ENCODED_BYTES: usize = 8 + 32 + 32 + 32;
 const MIN_EXECUTION_CONTEXT_ENCODED_BYTES: usize =
     1 + 8 + 1 + 20 + 8 + 8 + 32 + 32 + 32 + 1 + 1 + 1 + 1 + 1 + 1;
 const MIN_BLOCK_DESCRIPTOR_ENCODED_BYTES: usize =
     BLOCK_IDENTITY_ENCODED_BYTES + MIN_EXECUTION_CONTEXT_ENCODED_BYTES;
-const MIN_ADDED_BLOCK_ENCODED_BYTES: usize = MIN_BLOCK_DESCRIPTOR_ENCODED_BYTES + 4;
+const MIN_ADDED_BLOCK_ENCODED_BYTES: usize = MIN_BLOCK_DESCRIPTOR_ENCODED_BYTES + 4 + 1 + 4;
 const MIN_STATE_CHANGE_ENCODED_BYTES: usize = 1 + 32;
 
 /// A Keccak hash, block hash, state root, hashed address, or hashed slot.
@@ -53,10 +53,117 @@ pub type Address20 = [u8; 20];
 /// An unsigned 256-bit value encoded in big-endian byte order.
 pub type Word32 = [u8; 32];
 
+/// One complete canonical Ethereum block encoded as RLP (`header`, transactions, ommers, and,
+/// when present, withdrawals).
+///
+/// Bootstrap JSON represents these bytes as a lowercase, even-length, `0x`-prefixed hex string.
+/// TIPWIRE2 carries the same bytes verbatim behind a bounded big-endian `u32` length. The receiver
+/// must strictly decode the Ethereum block, verify it against the enclosing descriptor, and require
+/// byte-identical canonical re-encoding before publishing a generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalBlockRlp(Vec<u8>);
+
+impl CanonicalBlockRlp {
+    /// Wraps bytes produced by a canonical Ethereum block encoder.
+    pub const fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrows the encoded block bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns the encoded byte length.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether the encoded block is empty and therefore invalid in a container.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Consumes the wrapper and returns the encoded bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for CanonicalBlockRlp {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Serialize for CanonicalBlockRlp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let capacity =
+            self.0.len().checked_mul(2).and_then(|length| length.checked_add(2)).ok_or_else(
+                || <S::Error as ser::Error>::custom("canonical block RLP hex length overflow"),
+            )?;
+        let mut encoded = String::with_capacity(capacity);
+        encoded.push_str("0x");
+        for byte in &self.0 {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        serializer.serialize_str(&encoded)
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalBlockRlp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = <&str>::deserialize(deserializer)?;
+        let digits = encoded.strip_prefix("0x").ok_or_else(|| {
+            <D::Error as de::Error>::custom("canonical block RLP must start with 0x")
+        })?;
+        if digits.len() % 2 != 0 {
+            return Err(<D::Error as de::Error>::custom(
+                "canonical block RLP hex length must be even",
+            ));
+        }
+
+        let mut bytes = Vec::with_capacity(digits.len() / 2);
+        for pair in digits.as_bytes().as_chunks::<2>().0 {
+            let high = decode_lower_hex_nibble(pair[0]).ok_or_else(|| {
+                <D::Error as de::Error>::custom(
+                    "canonical block RLP must use lowercase hexadecimal",
+                )
+            })?;
+            let low = decode_lower_hex_nibble(pair[1]).ok_or_else(|| {
+                <D::Error as de::Error>::custom(
+                    "canonical block RLP must use lowercase hexadecimal",
+                )
+            })?;
+            bytes.push((high << 4) | low);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+const fn decode_lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
 /// Symmetric producer/receiver bounds. Raising them is an explicit capacity decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeLimits {
     pub max_frame_bytes: usize,
+    pub max_block_rlp_bytes: usize,
+    pub max_total_block_rlp_bytes: usize,
     pub max_removed_blocks: usize,
     pub max_added_blocks: usize,
     pub max_operations_per_block: usize,
@@ -69,6 +176,8 @@ impl Default for DecodeLimits {
     fn default() -> Self {
         Self {
             max_frame_bytes: 64 * 1024 * 1024,
+            max_block_rlp_bytes: 32 * 1024 * 1024,
+            max_total_block_rlp_bytes: 48 * 1024 * 1024,
             max_removed_blocks: 256,
             max_added_blocks: 256,
             max_operations_per_block: 1_000_000,
@@ -216,6 +325,7 @@ pub enum StateChange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddedBlock {
     pub block: BlockDescriptor,
+    pub block_rlp: CanonicalBlockRlp,
     pub changes: Vec<StateChange>,
 }
 
@@ -249,8 +359,8 @@ impl StreamIdentity {
             return Err(WireError::ZeroIdentity("seed_generation_id"));
         }
         self.seed_anchor.validate()?;
-        if self.seed_anchor.identity.number == 0
-            && self.seed_anchor.identity.hash != self.genesis_hash
+        if self.seed_anchor.identity.number == 0 &&
+            self.seed_anchor.identity.hash != self.genesis_hash
         {
             return Err(WireError::GenesisAnchorMismatch);
         }
@@ -353,8 +463,8 @@ impl RecentBlockHashes {
                 received_len: self.hashes.len(),
             });
         }
-        if let Some(parent) = self.hashes.last()
-            && *parent != tip.parent_hash
+        if let Some(parent) = self.hashes.last() &&
+            *parent != tip.parent_hash
         {
             return Err(WireError::BlockHashWindowParentMismatch);
         }
@@ -389,9 +499,9 @@ impl TransitionBatch {
         self.validate_removed_order()?;
         self.validate_added_order(limits)?;
         self.recent_block_hashes.validate_for_tip(&self.new_tip.identity, limits)?;
-        if !self.recent_block_hashes.hashes.is_empty()
-            && self.recent_block_hashes.start_number == 0
-            && self.recent_block_hashes.hashes.first() != Some(&self.stream.genesis_hash)
+        if !self.recent_block_hashes.hashes.is_empty() &&
+            self.recent_block_hashes.start_number == 0 &&
+            self.recent_block_hashes.hashes.first() != Some(&self.stream.genesis_hash)
         {
             return Err(WireError::BlockHashWindowGenesisMismatch);
         }
@@ -434,8 +544,8 @@ impl TransitionBatch {
             }
         }
         let oldest_removed = self.removed.last().ok_or(WireError::RemovedOrder)?;
-        if oldest_removed.number.checked_sub(1) != Some(self.common_ancestor.identity.number)
-            || oldest_removed.parent_hash != self.common_ancestor.identity.hash
+        if oldest_removed.number.checked_sub(1) != Some(self.common_ancestor.identity.number) ||
+            oldest_removed.parent_hash != self.common_ancestor.identity.hash
         {
             return Err(WireError::RemovedOrder);
         }
@@ -466,11 +576,21 @@ impl TransitionBatch {
 
         let mut previous = &self.common_ancestor;
         let mut total_operations = 0usize;
+        let mut total_block_rlp_bytes = 0usize;
         for added in &self.added {
             added.block.validate()?;
-            if added.block.identity.number
-                != previous.identity.number.checked_add(1).ok_or(WireError::BlockNumberOverflow)?
-                || added.block.identity.parent_hash != previous.identity.hash
+            validate_block_rlp(&added.block_rlp, limits)?;
+            total_block_rlp_bytes = total_block_rlp_bytes
+                .checked_add(added.block_rlp.len())
+                .ok_or(WireError::LengthOverflow)?;
+            check_limit(
+                "total_block_rlp_bytes",
+                total_block_rlp_bytes,
+                limits.max_total_block_rlp_bytes,
+            )?;
+            if added.block.identity.number !=
+                previous.identity.number.checked_add(1).ok_or(WireError::BlockNumberOverflow)? ||
+                added.block.identity.parent_hash != previous.identity.hash
             {
                 return Err(WireError::AddedOrder);
             }
@@ -497,6 +617,16 @@ impl TransitionBatch {
         }
         Ok(())
     }
+}
+
+fn validate_block_rlp(
+    block_rlp: &CanonicalBlockRlp,
+    limits: &DecodeLimits,
+) -> Result<(), WireError> {
+    if block_rlp.is_empty() {
+        return Err(WireError::EmptyCanonicalBlockRlp);
+    }
+    check_limit("block_rlp_bytes", block_rlp.len(), limits.max_block_rlp_bytes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -534,20 +664,20 @@ fn validate_changes(changes: &[StateChange], limits: &DecodeLimits) -> Result<()
             StateChange::StorageSet { value, .. } if is_zero(value) => {
                 return Err(WireError::ZeroStorageSet);
             }
-            StateChange::AccountSet { .. }
-            | StateChange::StorageWipe { .. }
-            | StateChange::StorageSet { .. }
-            | StateChange::StorageClear { .. } => {}
+            StateChange::AccountSet { .. } |
+            StateChange::StorageWipe { .. } |
+            StateChange::StorageSet { .. } |
+            StateChange::StorageClear { .. } => {}
         }
     }
     for change in changes {
         let account = match change {
-            StateChange::StorageWipe { account }
-            | StateChange::StorageSet { account, .. }
-            | StateChange::StorageClear { account, .. } => Some(account),
-            StateChange::CodeInsert { .. }
-            | StateChange::AccountSet { .. }
-            | StateChange::AccountDelete { .. } => None,
+            StateChange::StorageWipe { account } |
+            StateChange::StorageSet { account, .. } |
+            StateChange::StorageClear { account, .. } => Some(account),
+            StateChange::CodeInsert { .. } |
+            StateChange::AccountSet { .. } |
+            StateChange::AccountDelete { .. } => None,
         };
         if account.is_some_and(|account| deleted_accounts.binary_search(account).is_ok()) {
             return Err(WireError::StorageForDeletedAccount);
@@ -567,8 +697,8 @@ fn change_key(change: &StateChange) -> ChangeKey {
         StateChange::StorageWipe { account } => {
             ChangeKey { class: 2, primary: *account, secondary: [0; 32] }
         }
-        StateChange::StorageSet { account, slot, .. }
-        | StateChange::StorageClear { account, slot } => {
+        StateChange::StorageSet { account, slot, .. } |
+        StateChange::StorageClear { account, slot } => {
             ChangeKey { class: 3, primary: *account, secondary: *slot }
         }
     }
@@ -586,11 +716,11 @@ fn descriptors_are_contiguous(
     older: &BlockDescriptor,
     newer: &BlockDescriptor,
 ) -> Result<bool, WireError> {
-    Ok(newer.identity.number
-        == older.identity.number.checked_add(1).ok_or(WireError::BlockNumberOverflow)?
-        && newer.identity.parent_hash == older.identity.hash
-        && newer.execution.timestamp > older.execution.timestamp
-        && newer.execution.active_fork >= older.execution.active_fork)
+    Ok(newer.identity.number ==
+        older.identity.number.checked_add(1).ok_or(WireError::BlockNumberOverflow)? &&
+        newer.identity.parent_hash == older.identity.hash &&
+        newer.execution.timestamp > older.execution.timestamp &&
+        newer.execution.active_fork >= older.execution.active_fork)
 }
 
 fn require_fork_field(field: &'static str, present: bool, required: bool) -> Result<(), WireError> {
@@ -673,6 +803,8 @@ pub enum WireError {
     NonIncreasingTimestamp,
     #[error("active execution fork regressed across added blocks")]
     ForkRegression,
+    #[error("canonical full-block RLP must not be empty")]
+    EmptyCanonicalBlockRlp,
     #[error("state changes are not in canonical code/account/wipe/storage key order")]
     NonCanonicalChangeOrder,
     #[error("code insert contains empty bytecode")]
@@ -803,16 +935,16 @@ impl TransitionCursor {
         if checkpoint.history_limit == 0 {
             return Err(WireError::ZeroHistoryLimit);
         }
-        if checkpoint.canonical_history.is_empty()
-            || checkpoint.canonical_history.len() > checkpoint.history_limit
+        if checkpoint.canonical_history.is_empty() ||
+            checkpoint.canonical_history.len() > checkpoint.history_limit
         {
             return Err(WireError::InvalidCheckpointHistory);
         }
         for block in &checkpoint.canonical_history {
             block.validate()?;
-            if block.identity.number < checkpoint.stream.seed_anchor.identity.number
-                || (block.identity.number == checkpoint.stream.seed_anchor.identity.number
-                    && block != &checkpoint.stream.seed_anchor)
+            if block.identity.number < checkpoint.stream.seed_anchor.identity.number ||
+                (block.identity.number == checkpoint.stream.seed_anchor.identity.number &&
+                    block != &checkpoint.stream.seed_anchor)
             {
                 return Err(WireError::InvalidCheckpointHistory);
             }
@@ -828,20 +960,20 @@ impl TransitionCursor {
         if checkpoint.sequence < checkpoint.stream.seed_sequence {
             return Err(WireError::InvalidCheckpointAck);
         }
-        if checkpoint.sequence == checkpoint.stream.seed_sequence
-            && checkpoint.canonical_history.as_slice()
-                != std::slice::from_ref(&checkpoint.stream.seed_anchor)
+        if checkpoint.sequence == checkpoint.stream.seed_sequence &&
+            checkpoint.canonical_history.as_slice() !=
+                std::slice::from_ref(&checkpoint.stream.seed_anchor)
         {
             return Err(WireError::InvalidCheckpointHistory);
         }
         match &checkpoint.last_ack {
-            None if checkpoint.sequence == checkpoint.stream.seed_sequence
-                && checkpoint.tip == checkpoint.stream.seed_anchor => {}
+            None if checkpoint.sequence == checkpoint.stream.seed_sequence &&
+                checkpoint.tip == checkpoint.stream.seed_anchor => {}
             Some(ack)
-                if checkpoint.sequence > checkpoint.stream.seed_sequence
-                    && ack.seed_generation_id == checkpoint.stream.seed_generation_id
-                    && ack.sequence == checkpoint.sequence
-                    && ack.new_tip == checkpoint.tip.identity => {}
+                if checkpoint.sequence > checkpoint.stream.seed_sequence &&
+                    ack.seed_generation_id == checkpoint.stream.seed_generation_id &&
+                    ack.sequence == checkpoint.sequence &&
+                    ack.new_tip == checkpoint.tip.identity => {}
             _ => return Err(WireError::InvalidCheckpointAck),
         }
         Ok(Self {
@@ -907,9 +1039,9 @@ impl TransitionCursor {
                     sequence: decoded.batch.sequence,
                 });
             };
-            if last_ack.seed_generation_id == decoded.batch.stream.seed_generation_id
-                && last_ack.sequence == decoded.batch.sequence
-                && last_ack.frame_digest == decoded.frame_digest
+            if last_ack.seed_generation_id == decoded.batch.stream.seed_generation_id &&
+                last_ack.sequence == decoded.batch.sequence &&
+                last_ack.frame_digest == decoded.frame_digest
             {
                 return Ok(ReceiverDecision::Idempotent { ack: last_ack.clone() });
             }
@@ -985,10 +1117,7 @@ pub fn encode_frame_with_limits(
 
     let expected_payload_len = encoded_payload_len(batch)?;
     let payload_len = u32::try_from(expected_payload_len).map_err(|_| WireError::LengthOverflow)?;
-    let frame_len = FRAME_HEADER_BYTES
-        .checked_add(expected_payload_len)
-        .and_then(|length| length.checked_add(FRAME_CHECKSUM_BYTES))
-        .ok_or(WireError::LengthOverflow)?;
+    let frame_len = encoded_frame_len(expected_payload_len)?;
     if frame_len > limits.max_frame_bytes {
         return Err(WireError::FrameTooLarge { declared: frame_len, max: limits.max_frame_bytes });
     }
@@ -1007,6 +1136,8 @@ pub fn encode_frame_with_limits(
     put_len(&mut payload, batch.added.len())?;
     for added in &batch.added {
         encode_block_descriptor(&mut payload, &added.block);
+        put_len(&mut payload, added.block_rlp.len())?;
+        payload.extend_from_slice(added.block_rlp.as_slice());
         put_len(&mut payload, added.changes.len())?;
         for change in &added.changes {
             encode_change(&mut payload, change)?;
@@ -1040,42 +1171,117 @@ pub fn encode_frame_with_limits(
     Ok(frame)
 }
 
+/// Returns the exact TIPWIRE2 payload bytes occupied by one added block.
+///
+/// This measures only the encoding. Callers must still validate the block and configured bounds.
+/// The result can be accumulated once per block and passed to
+/// [`encoded_forward_frame_len`] to size candidate forward chunks in linear time.
+pub fn encoded_added_block_len(added: &AddedBlock) -> Result<usize, WireError> {
+    let mut length = 0usize;
+    add_encoded_len(&mut length, encoded_block_descriptor_len(&added.block)?)?;
+    check_wire_count(added.block_rlp.len())?;
+    add_encoded_len(&mut length, 4)?;
+    add_encoded_len(&mut length, added.block_rlp.len())?;
+    check_wire_count(added.changes.len())?;
+    add_encoded_len(&mut length, 4)?;
+    for change in &added.changes {
+        add_encoded_len(&mut length, encoded_change_len(change)?)?;
+    }
+    Ok(length)
+}
+
+/// Returns the exact total TIPWIRE2 frame bytes for a pure forward transition.
+///
+/// `encoded_added_blocks_len` must be the checked sum of [`encoded_added_block_len`] for the
+/// `added_count` consecutive blocks, and `new_tip` must be the final one. This split interface lets
+/// a producer evaluate each additional block in constant time without duplicating the wire
+/// format's length formula. Semantic validation remains the responsibility of frame encoding.
+pub fn encoded_forward_frame_len(
+    stream: &StreamIdentity,
+    old_tip: &BlockDescriptor,
+    new_tip: &BlockDescriptor,
+    added_count: usize,
+    encoded_added_blocks_len: usize,
+) -> Result<usize, WireError> {
+    if added_count == 0 {
+        return Err(WireError::EmptyCanonicalUpdate);
+    }
+    let recent_hash_count = usize::try_from(new_tip.identity.number.min(BLOCKHASH_WINDOW as u64))
+        .map_err(|_| WireError::LengthOverflow)?;
+    let payload_len = encoded_transition_payload_len(
+        stream,
+        old_tip,
+        old_tip,
+        new_tip,
+        0,
+        added_count,
+        encoded_added_blocks_len,
+        recent_hash_count,
+    )?;
+    encoded_frame_len(payload_len)
+}
+
 fn encoded_payload_len(batch: &TransitionBatch) -> Result<usize, WireError> {
+    let mut encoded_added_blocks_len = 0usize;
+    for added in &batch.added {
+        add_encoded_len(&mut encoded_added_blocks_len, encoded_added_block_len(added)?)?;
+    }
+    encoded_transition_payload_len(
+        &batch.stream,
+        &batch.old_tip,
+        &batch.common_ancestor,
+        &batch.new_tip,
+        batch.removed.len(),
+        batch.added.len(),
+        encoded_added_blocks_len,
+        batch.recent_block_hashes.hashes.len(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encoded_transition_payload_len(
+    stream: &StreamIdentity,
+    old_tip: &BlockDescriptor,
+    common_ancestor: &BlockDescriptor,
+    new_tip: &BlockDescriptor,
+    removed_count: usize,
+    added_count: usize,
+    encoded_added_blocks_len: usize,
+    recent_hash_count: usize,
+) -> Result<usize, WireError> {
     let mut length = 0usize;
 
     add_encoded_len(&mut length, 8 + 32 + 32 + 8)?;
-    add_encoded_len(&mut length, encoded_block_descriptor_len(&batch.stream.seed_anchor)?)?;
+    add_encoded_len(&mut length, encoded_block_descriptor_len(&stream.seed_anchor)?)?;
     add_encoded_len(&mut length, 8)?;
-    for block in [&batch.old_tip, &batch.common_ancestor, &batch.new_tip] {
+    for block in [old_tip, common_ancestor, new_tip] {
         add_encoded_len(&mut length, encoded_block_descriptor_len(block)?)?;
     }
 
-    check_wire_count(batch.removed.len())?;
+    check_wire_count(removed_count)?;
     add_encoded_len(&mut length, 4)?;
     add_encoded_len(
         &mut length,
-        checked_encoded_product(batch.removed.len(), BLOCK_IDENTITY_ENCODED_BYTES)?,
+        checked_encoded_product(removed_count, BLOCK_IDENTITY_ENCODED_BYTES)?,
     )?;
 
-    check_wire_count(batch.added.len())?;
+    check_wire_count(added_count)?;
     add_encoded_len(&mut length, 4)?;
-    for added in &batch.added {
-        add_encoded_len(&mut length, encoded_block_descriptor_len(&added.block)?)?;
-        check_wire_count(added.changes.len())?;
-        add_encoded_len(&mut length, 4)?;
-        for change in &added.changes {
-            add_encoded_len(&mut length, encoded_change_len(change)?)?;
-        }
-    }
+    add_encoded_len(&mut length, encoded_added_blocks_len)?;
 
     add_encoded_len(&mut length, 8)?;
-    check_wire_count(batch.recent_block_hashes.hashes.len())?;
+    check_wire_count(recent_hash_count)?;
     add_encoded_len(&mut length, 4)?;
-    add_encoded_len(
-        &mut length,
-        checked_encoded_product(batch.recent_block_hashes.hashes.len(), 32)?,
-    )?;
+    add_encoded_len(&mut length, checked_encoded_product(recent_hash_count, 32)?)?;
     Ok(length)
+}
+
+fn encoded_frame_len(payload_len: usize) -> Result<usize, WireError> {
+    u32::try_from(payload_len).map_err(|_| WireError::LengthOverflow)?;
+    FRAME_HEADER_BYTES
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(FRAME_CHECKSUM_BYTES))
+        .ok_or(WireError::LengthOverflow)
 }
 
 fn encoded_block_descriptor_len(block: &BlockDescriptor) -> Result<usize, WireError> {
@@ -1147,10 +1353,7 @@ pub fn decode_frame_with_limits(
     limits: &DecodeLimits,
 ) -> Result<DecodedFrame, WireError> {
     if frame.len() > limits.max_frame_bytes {
-        return Err(WireError::FrameTooLarge {
-            declared: frame.len(),
-            max: limits.max_frame_bytes,
-        });
+        return Err(WireError::FrameTooLarge { declared: frame.len(), max: limits.max_frame_bytes });
     }
     if frame.len() < FRAME_HEADER_BYTES {
         return Err(WireError::Truncated { needed: FRAME_HEADER_BYTES, received: frame.len() });
@@ -1358,8 +1561,25 @@ fn decode_batch(
     let mut added = Vec::new();
     reserve(&mut added, added_len)?;
     let mut total_operations = 0usize;
+    let mut total_block_rlp_bytes = 0usize;
     for _ in 0..added_len {
         let block = decode_block_descriptor(reader)?;
+        let block_rlp_len =
+            reader.read_count("block_rlp_bytes", reader.limits.max_block_rlp_bytes)?;
+        if block_rlp_len == 0 {
+            return Err(WireError::EmptyCanonicalBlockRlp);
+        }
+        total_block_rlp_bytes =
+            total_block_rlp_bytes.checked_add(block_rlp_len).ok_or(WireError::LengthOverflow)?;
+        check_limit(
+            "total_block_rlp_bytes",
+            total_block_rlp_bytes,
+            reader.limits.max_total_block_rlp_bytes,
+        )?;
+        let encoded_block_rlp = reader.read_exact(block_rlp_len)?;
+        let mut block_rlp = Vec::new();
+        reserve(&mut block_rlp, block_rlp_len)?;
+        block_rlp.extend_from_slice(encoded_block_rlp);
         let operation_len =
             reader.read_count("operations_per_block", reader.limits.max_operations_per_block)?;
         reader.require_count_bytes(
@@ -1375,7 +1595,7 @@ fn decode_batch(
         for _ in 0..operation_len {
             changes.push(decode_change(reader)?);
         }
-        added.push(AddedBlock { block, changes });
+        added.push(AddedBlock { block, block_rlp: CanonicalBlockRlp::new(block_rlp), changes });
     }
     let recent_block_hashes = decode_recent_hashes(reader)?;
     Ok(TransitionBatch {
@@ -1651,6 +1871,10 @@ mod tests {
         ]
     }
 
+    fn block_rlp(tag: u8) -> CanonicalBlockRlp {
+        CanonicalBlockRlp::new(vec![0xc3, 0xc0, 0xc0, tag])
+    }
+
     fn forward_batch(sequence: u64) -> TransitionBatch {
         let stream = stream();
         let old_tip = stream.seed_anchor.clone();
@@ -1663,7 +1887,11 @@ mod tests {
             common_ancestor: old_tip,
             new_tip: new_tip.clone(),
             removed: Vec::new(),
-            added: vec![AddedBlock { block: new_tip.clone(), changes: changes() }],
+            added: vec![AddedBlock {
+                block: new_tip.clone(),
+                block_rlp: block_rlp(13),
+                changes: changes(),
+            }],
             recent_block_hashes: recent_for(&new_tip.identity),
         }
     }
@@ -1682,7 +1910,11 @@ mod tests {
             common_ancestor: common,
             new_tip: new_tip.clone(),
             removed: vec![old_tip.identity],
-            added: vec![AddedBlock { block: new_tip.clone(), changes: Vec::new() }],
+            added: vec![AddedBlock {
+                block: new_tip.clone(),
+                block_rlp: block_rlp(30),
+                changes: Vec::new(),
+            }],
             recent_block_hashes: recent_for(&new_tip.identity),
         }
     }
@@ -1725,6 +1957,19 @@ mod tests {
         let mut frame = encode_frame(&forward_batch(SEED_SEQUENCE + 1)).unwrap();
         frame[FRAME_HEADER_BYTES + 20] ^= 0x80;
         assert!(matches!(decode_frame(&frame), Err(WireError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn tipwire1_identity_is_rejected() {
+        let frame = encode_frame(&forward_batch(SEED_SEQUENCE + 1)).unwrap();
+
+        let mut old_magic = frame.clone();
+        old_magic[..8].copy_from_slice(b"TIPWIRE1");
+        assert_eq!(decode_frame(&old_magic), Err(WireError::InvalidMagic));
+
+        let mut old_schema = frame;
+        old_schema[8..10].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(decode_frame(&old_schema), Err(WireError::UnsupportedSchema(1)));
     }
 
     #[test]
@@ -1785,8 +2030,8 @@ mod tests {
             decode_block_descriptor(&mut reader).unwrap();
             decode_block_descriptor(&mut reader).unwrap();
             decode_block_descriptor(&mut reader).unwrap();
-            FRAME_HEADER_BYTES
-                + (frame[FRAME_HEADER_BYTES..checksum_start].len() - reader.remaining())
+            FRAME_HEADER_BYTES +
+                (frame[FRAME_HEADER_BYTES..checksum_start].len() - reader.remaining())
         };
         let malicious_count = 1_000_000u32;
         frame[removed_count_offset..removed_count_offset + 4]
@@ -1818,6 +2063,98 @@ mod tests {
         assert_eq!(
             decode_frame_with_limits(&frame, &limits),
             Err(WireError::LimitExceeded { field: "code_bytes", value: 3, max: 2 })
+        );
+    }
+
+    #[test]
+    fn canonical_block_rlp_limits_are_enforced_on_encode_and_decode() {
+        let mut empty = forward_batch(SEED_SEQUENCE + 1);
+        empty.added[0].block_rlp = CanonicalBlockRlp::new(Vec::new());
+        assert_eq!(encode_frame(&empty), Err(WireError::EmptyCanonicalBlockRlp));
+
+        let batch = forward_batch(SEED_SEQUENCE + 1);
+        let per_block_limit = DecodeLimits {
+            max_block_rlp_bytes: batch.added[0].block_rlp.len() - 1,
+            ..DecodeLimits::default()
+        };
+        assert_eq!(
+            encode_frame_with_limits(&batch, &per_block_limit),
+            Err(WireError::LimitExceeded {
+                field: "block_rlp_bytes",
+                value: batch.added[0].block_rlp.len(),
+                max: batch.added[0].block_rlp.len() - 1,
+            })
+        );
+
+        let frame = encode_frame(&batch).unwrap();
+        assert_eq!(
+            decode_frame_with_limits(&frame, &per_block_limit),
+            Err(WireError::LimitExceeded {
+                field: "block_rlp_bytes",
+                value: batch.added[0].block_rlp.len(),
+                max: batch.added[0].block_rlp.len() - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn aggregate_canonical_block_rlp_limit_is_enforced() {
+        let mut batch = forward_batch(SEED_SEQUENCE + 1);
+        let block_three = batch.new_tip.clone();
+        let block_four = block(4, 14, block_three.identity.hash);
+        batch.new_tip = block_four.clone();
+        batch.added.push(AddedBlock {
+            block: block_four.clone(),
+            block_rlp: block_rlp(14),
+            changes: Vec::new(),
+        });
+        batch.recent_block_hashes = RecentBlockHashes {
+            start_number: 0,
+            hashes: vec![
+                hash(9),
+                hash(11),
+                batch.stream.seed_anchor.identity.hash,
+                block_three.identity.hash,
+            ],
+        };
+        let total = batch.added.iter().map(|added| added.block_rlp.len()).sum::<usize>();
+        let limits =
+            DecodeLimits { max_total_block_rlp_bytes: total - 1, ..DecodeLimits::default() };
+        assert_eq!(
+            encode_frame_with_limits(&batch, &limits),
+            Err(WireError::LimitExceeded {
+                field: "total_block_rlp_bytes",
+                value: total,
+                max: total - 1,
+            })
+        );
+        let frame = encode_frame(&batch).unwrap();
+        assert_eq!(
+            decode_frame_with_limits(&frame, &limits),
+            Err(WireError::LimitExceeded {
+                field: "total_block_rlp_bytes",
+                value: total,
+                max: total - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn forward_frame_length_uses_the_encoder_formula() {
+        let batch = forward_batch(SEED_SEQUENCE + 1);
+        let encoded_added_blocks_len = batch.added.iter().try_fold(0usize, |total, added| {
+            total.checked_add(encoded_added_block_len(added)?).ok_or(WireError::LengthOverflow)
+        });
+        assert_eq!(
+            encoded_forward_frame_len(
+                &batch.stream,
+                &batch.old_tip,
+                &batch.new_tip,
+                batch.added.len(),
+                encoded_added_blocks_len.unwrap(),
+            )
+            .unwrap(),
+            encode_frame(&batch).unwrap().len()
         );
     }
 
@@ -1963,8 +2300,16 @@ mod tests {
             new_tip: block_four.clone(),
             removed: Vec::new(),
             added: vec![
-                AddedBlock { block: block_three.clone(), changes: Vec::new() },
-                AddedBlock { block: block_four.clone(), changes: Vec::new() },
+                AddedBlock {
+                    block: block_three.clone(),
+                    block_rlp: block_rlp(13),
+                    changes: Vec::new(),
+                },
+                AddedBlock {
+                    block: block_four.clone(),
+                    block_rlp: block_rlp(14),
+                    changes: Vec::new(),
+                },
             ],
             recent_block_hashes: RecentBlockHashes {
                 start_number: 0,

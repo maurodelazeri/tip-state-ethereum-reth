@@ -78,6 +78,10 @@ pub struct NormalizedBlock {
     pub identity: BlockIdentity,
     /// The complete Ethereum header is retained so no execution-relevant field is discarded.
     pub header: Header,
+    /// Canonical RLP of the complete block, including signed transactions, ommers, and
+    /// post-Shanghai withdrawals. Replicas retain this with the generation so current-tip block
+    /// RPC never calls back into Reth.
+    pub block_rlp: Vec<u8>,
     /// Mainnet fork selection, chain ID, EVM limits, and block environment derived by Reth.
     pub evm_env: EvmEnv<SpecId>,
     /// Apply before storage updates so newly created accounts have a storage namespace.
@@ -170,6 +174,8 @@ pub enum NormalizeError {
     RevertWalkRemainder { remaining: usize },
     #[error("bytecode table key {expected:?} does not match Keccak-256 {actual:?}")]
     CodeHashMismatch { expected: B256, actual: B256 },
+    #[error("block {block} failed canonical pre-execution validation: {reason}")]
+    InvalidCanonicalBlock { block: BlockNumber, reason: String },
 }
 
 /// Normalize one non-empty Ethereum `Chain` without consulting a provider or RPC endpoint.
@@ -178,6 +184,16 @@ pub fn normalize_chain(
     evm_config: &EthEvmConfig,
 ) -> Result<NormalizedChain, NormalizeError> {
     validate_chain_shape(chain)?;
+    for block in chain.blocks().values() {
+        reth_consensus_common::validation::validate_block_pre_execution(
+            block.sealed_block(),
+            evm_config.chain_spec().as_ref(),
+        )
+        .map_err(|error| NormalizeError::InvalidCanonicalBlock {
+            block: block.header().number,
+            reason: error.to_string(),
+        })?;
+    }
 
     let codes = normalize_codes(chain.execution_outcome().state())?;
     let (source, deltas) = if chain.trie_data().is_empty() {
@@ -213,6 +229,7 @@ pub fn normalize_chain(
         .zip(deltas)
         .map(|(block, delta)| {
             let header = block.header().clone();
+            let block_rlp = alloy_rlp::encode(block.sealed_block());
             let evm_env = evm_config.evm_env(&header).expect("EthEvmConfig::evm_env is infallible");
             NormalizedBlock {
                 identity: BlockIdentity {
@@ -222,6 +239,7 @@ pub fn normalize_chain(
                     state_root: header.state_root,
                 },
                 header,
+                block_rlp,
                 evm_env,
                 account_sets: delta.account_sets,
                 storage_updates: delta.storage_updates,
@@ -287,8 +305,8 @@ fn validate_chain_shape(chain: &Chain<EthPrimitives>) -> Result<(), NormalizeErr
                 header: block.header().number,
             });
         }
-        if let Some(expected_parent) = previous_hash
-            && block.header().parent_hash != expected_parent
+        if let Some(expected_parent) = previous_hash &&
+            block.header().parent_hash != expected_parent
         {
             return Err(NormalizeError::ParentHashMismatch {
                 number,
@@ -501,7 +519,7 @@ mod tests {
     use super::*;
     use alloy_eips::eip7685::Requests;
     use alloy_primitives::map::{AddressMap, B256Map};
-    use reth_ethereum_primitives::{Block, Receipt};
+    use reth_ethereum_primitives::{Block, BlockBody, Receipt};
     use reth_execution_types::ExecutionOutcome;
     use reth_primitives_traits::RecoveredBlock;
     use reth_trie_common::{
@@ -586,6 +604,11 @@ mod tests {
     }
 
     fn recovered_block(number: u64, parent_hash: B256) -> RecoveredBlock<Block> {
+        let body = BlockBody {
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+            withdrawals: Some(Default::default()),
+        };
         let header = Header {
             number,
             parent_hash,
@@ -596,13 +619,13 @@ mod tests {
             base_fee_per_gas: Some(1_000_000_000 + number),
             mix_hash: B256::repeat_byte(0x42),
             excess_blob_gas: Some(number),
-            blob_gas_used: Some(393_216),
+            blob_gas_used: Some(0),
             parent_beacon_block_root: Some(B256::repeat_byte(0x43)),
-            withdrawals_root: Some(B256::repeat_byte(0x44)),
+            withdrawals_root: body.calculate_withdrawals_root(),
             ..Default::default()
         };
         let hash = header.hash_slow();
-        RecoveredBlock::new(Block { header, body: Default::default() }, Vec::new(), hash)
+        RecoveredBlock::new(Block { header, body }, Vec::new(), hash)
     }
 
     #[allow(clippy::vec_init_then_push)] // Each entry mutates the aggregate used by the next.
@@ -1078,6 +1101,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_block_body_that_disagrees_with_canonical_header() {
+        let fixture = fixture();
+        let mut blocks =
+            fixture.blocks.iter().cloned().map(RecoveredBlock::into_block).collect::<Vec<_>>();
+        blocks[0].header.transactions_root = B256::repeat_byte(0xee);
+        for index in 1..blocks.len() {
+            let parent_hash = blocks[index - 1].header.hash_slow();
+            blocks[index].header.parent_hash = parent_hash;
+        }
+        let blocks = blocks
+            .into_iter()
+            .map(|block| {
+                let hash = block.header.hash_slow();
+                RecoveredBlock::new(block, Vec::new(), hash)
+            })
+            .collect::<Vec<_>>();
+        let chain = Chain::new(blocks, fixture.outcome, BTreeMap::new());
+        assert!(matches!(
+            normalize_chain(&chain, &EthEvmConfig::mainnet()),
+            Err(NormalizeError::InvalidCanonicalBlock { block, .. }) if block == FIRST_BLOCK
+        ));
+    }
+
+    #[test]
     fn rejects_wrong_flat_delta_keys_and_unsorted_per_block_delta() {
         let fixture = fixture();
         let mut wrong_delta_keys = BTreeMap::new();
@@ -1142,6 +1189,11 @@ mod tests {
     #[test]
     fn per_block_and_aggregate_deltas_map_to_identical_valid_wire_additions() {
         let fixture = fixture();
+        let expected_block_rlp = fixture
+            .blocks
+            .iter()
+            .map(|block| alloy_rlp::encode(block.sealed_block()))
+            .collect::<Vec<_>>();
         let evm_config = EthEvmConfig::mainnet();
         let per_block = normalize_chain(&make_chain(&fixture, true), &evm_config).unwrap();
         let aggregate = normalize_chain(&make_chain(&fixture, false), &evm_config).unwrap();
@@ -1149,6 +1201,12 @@ mod tests {
         let aggregate_added = wire::map_added_blocks(&aggregate).unwrap();
 
         assert_eq!(per_block_added, aggregate_added);
+        for ((normalized, added), expected) in
+            per_block.blocks.iter().zip(&per_block_added).zip(expected_block_rlp)
+        {
+            assert_eq!(normalized.block_rlp.as_slice(), expected.as_slice());
+            assert_eq!(added.block_rlp.as_slice(), normalized.block_rlp.as_slice());
+        }
         assert!(matches!(
             per_block_added[0].changes.first(),
             Some(tip_state_wire::StateChange::CodeInsert { code_hash, .. })
@@ -1181,9 +1239,9 @@ mod tests {
             tip_state_wire::StateChange::AccountDelete { account } if *account == deleted
         )));
         assert!(per_block_added[0].changes.iter().all(|change| match change {
-            tip_state_wire::StateChange::StorageWipe { account }
-            | tip_state_wire::StateChange::StorageSet { account, .. }
-            | tip_state_wire::StateChange::StorageClear { account, .. } => *account != deleted,
+            tip_state_wire::StateChange::StorageWipe { account } |
+            tip_state_wire::StateChange::StorageSet { account, .. } |
+            tip_state_wire::StateChange::StorageClear { account, .. } => *account != deleted,
             _ => true,
         }));
 

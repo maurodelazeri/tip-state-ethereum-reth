@@ -9,11 +9,14 @@ use blake3::Hasher;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{is_zero, BlockDescriptor, DecodeLimits, Hash32, RecentBlockHashes, WireError};
+use crate::{
+    is_zero, validate_block_rlp, BlockDescriptor, CanonicalBlockRlp, DecodeLimits, Hash32,
+    RecentBlockHashes, WireError,
+};
 
-pub const BOOTSTRAP_SCHEMA_VERSION: u16 = 1;
-pub const DEFAULT_MAX_BOOTSTRAP_MESSAGE_BYTES: usize = 128 * 1024;
-const BOOTSTRAP_DIGEST_DOMAIN: &[u8] = b"tip-state-bootstrap-message-v1";
+pub const BOOTSTRAP_SCHEMA_VERSION: u16 = 2;
+pub const DEFAULT_MAX_BOOTSTRAP_MESSAGE_BYTES: usize = 65 * 1024 * 1024;
+const BOOTSTRAP_DIGEST_DOMAIN: &[u8] = b"tip-state-bootstrap-message-v2";
 
 /// Exact state source pinned by the trusted Reth initializer while canonical progression is gated.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +28,7 @@ pub struct SeedRequest {
     pub genesis_hash: Hash32,
     pub snapshot_transaction_id: u64,
     pub anchor: BlockDescriptor,
+    pub anchor_block_rlp: CanonicalBlockRlp,
     pub recent_block_hashes: RecentBlockHashes,
 }
 
@@ -43,15 +47,16 @@ impl SeedRequest {
             return Err(BootstrapError::ZeroGenesisHash);
         }
         self.anchor.validate().map_err(BootstrapError::Wire)?;
+        validate_block_rlp(&self.anchor_block_rlp, limits).map_err(BootstrapError::Wire)?;
         if self.anchor.identity.number == 0 && self.anchor.identity.hash != self.genesis_hash {
             return Err(BootstrapError::GenesisAnchorMismatch);
         }
         self.recent_block_hashes
             .validate_for_tip(&self.anchor.identity, limits)
             .map_err(BootstrapError::Wire)?;
-        if self.recent_block_hashes.start_number == 0
-            && !self.recent_block_hashes.hashes.is_empty()
-            && self.recent_block_hashes.hashes.first() != Some(&self.genesis_hash)
+        if self.recent_block_hashes.start_number == 0 &&
+            !self.recent_block_hashes.hashes.is_empty() &&
+            self.recent_block_hashes.hashes.first() != Some(&self.genesis_hash)
         {
             return Err(BootstrapError::GenesisWindowMismatch);
         }
@@ -207,6 +212,7 @@ mod tests {
                     requests_hash: Some(hash(12)),
                 },
             },
+            anchor_block_rlp: CanonicalBlockRlp::new(vec![0xc3, 0xc0, 0xc0, 0xc0]),
             recent_block_hashes: RecentBlockHashes {
                 start_number: 0,
                 hashes: vec![hash(1), hash(2)],
@@ -219,6 +225,7 @@ mod tests {
         let request = request();
         request.validate(&DecodeLimits::default()).unwrap();
         let encoded = encode_message(&request, DEFAULT_MAX_BOOTSTRAP_MESSAGE_BYTES).unwrap();
+        assert!(String::from_utf8_lossy(&encoded).contains("\"anchor_block_rlp\":\"0xc3c0c0c0\""));
         let digest = message_digest(&encoded);
         let decoded: SeedRequest =
             decode_message(&encoded, DEFAULT_MAX_BOOTSTRAP_MESSAGE_BYTES).unwrap();
@@ -251,6 +258,57 @@ mod tests {
         assert!(matches!(
             decode_message::<SeedRequest>(br#"{"unknown":true}"#, 1024),
             Err(BootstrapError::Decode(_))
+        ));
+
+        let mut uppercase = serde_json::to_value(request()).unwrap();
+        uppercase["anchor_block_rlp"] = serde_json::Value::String("0xC3c0c0c0".to_owned());
+        let uppercase = serde_json::to_vec(&uppercase).unwrap();
+        assert!(matches!(
+            decode_message::<SeedRequest>(&uppercase, DEFAULT_MAX_BOOTSTRAP_MESSAGE_BYTES),
+            Err(BootstrapError::Decode(_))
+        ));
+
+        let mut missing_prefix = serde_json::to_value(request()).unwrap();
+        missing_prefix["anchor_block_rlp"] = serde_json::Value::String("c3c0c0c0".to_owned());
+        let missing_prefix = serde_json::to_vec(&missing_prefix).unwrap();
+        assert!(matches!(
+            decode_message::<SeedRequest>(&missing_prefix, DEFAULT_MAX_BOOTSTRAP_MESSAGE_BYTES),
+            Err(BootstrapError::Decode(_))
+        ));
+
+        let mut odd_length = serde_json::to_value(request()).unwrap();
+        odd_length["anchor_block_rlp"] = serde_json::Value::String("0xc3c".to_owned());
+        let odd_length = serde_json::to_vec(&odd_length).unwrap();
+        assert!(matches!(
+            decode_message::<SeedRequest>(&odd_length, DEFAULT_MAX_BOOTSTRAP_MESSAGE_BYTES),
+            Err(BootstrapError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn empty_or_over_limit_anchor_block_rlp_fails_closed() {
+        let mut empty = request();
+        empty.anchor_block_rlp = CanonicalBlockRlp::new(Vec::new());
+        assert!(matches!(
+            empty.validate(&DecodeLimits::default()),
+            Err(BootstrapError::Wire(WireError::EmptyCanonicalBlockRlp))
+        ));
+
+        let limits = DecodeLimits { max_block_rlp_bytes: 3, ..DecodeLimits::default() };
+        assert!(matches!(
+            request().validate(&limits),
+            Err(BootstrapError::Wire(WireError::LimitExceeded {
+                field: "block_rlp_bytes",
+                value: 4,
+                max: 3,
+            }))
+        ));
+
+        let mut old_schema = request();
+        old_schema.schema_version = 1;
+        assert!(matches!(
+            old_schema.validate(&DecodeLimits::default()),
+            Err(BootstrapError::UnsupportedSchema(1))
         ));
     }
 }

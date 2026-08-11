@@ -22,7 +22,10 @@ use reth_ethereum::{
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::Chain;
-use tip_state_wire::{AddedBlock, BlockIdentity, DecodeLimits, StreamIdentity};
+use tip_state_wire::{
+    encoded_added_block_len, encoded_forward_frame_len, AddedBlock, BlockDescriptor, BlockIdentity,
+    DecodeLimits, StreamIdentity,
+};
 
 use example_tip_state_exex::{
     coordinator::{PreparedTransition, ProducerCoordinator},
@@ -118,7 +121,7 @@ where
     while let Some(notification) = ctx.notifications.try_next().await? {
         let (removed, added) = map_notification(&notification, ctx.evm_config())?;
         if removed.is_empty() {
-            for chunk in split_forward(added)? {
+            for chunk in split_forward(added, coordinator.stream(), coordinator.tip())? {
                 deliver_transition(&mut coordinator, &mut connection, &outbox, Vec::new(), chunk)
                     .await?;
                 send_finished_height(&ctx, coordinator.tip())?;
@@ -169,26 +172,73 @@ fn removed_identities(
         .collect())
 }
 
-fn split_forward(added: Vec<AddedBlock>) -> eyre::Result<Vec<Vec<AddedBlock>>> {
-    let limits = DecodeLimits::default();
+fn split_forward(
+    added: Vec<AddedBlock>,
+    stream: &StreamIdentity,
+    old_tip: &BlockDescriptor,
+) -> eyre::Result<Vec<Vec<AddedBlock>>> {
+    split_forward_with_limits(added, stream, old_tip, &DecodeLimits::default())
+}
+
+fn split_forward_with_limits(
+    added: Vec<AddedBlock>,
+    stream: &StreamIdentity,
+    old_tip: &BlockDescriptor,
+    limits: &DecodeLimits,
+) -> eyre::Result<Vec<Vec<AddedBlock>>> {
     let mut chunks = Vec::new();
-    let mut current = Vec::new();
+    let mut current: Vec<AddedBlock> = Vec::new();
+    let mut current_old_tip = old_tip.clone();
     let mut current_operations = 0usize;
+    let mut current_block_rlp_bytes = 0usize;
+    let mut current_encoded_added_bytes = 0usize;
     for block in added {
         let operations = block.changes.len();
+        let block_rlp_bytes = block.block_rlp.len();
         eyre::ensure!(
             operations <= limits.max_operations_per_block,
             "block {} has {operations} state operations, maximum is {}",
             block.block.identity.number,
             limits.max_operations_per_block
         );
-        let would_exceed = current.len() == limits.max_added_blocks ||
-            current_operations
-                .checked_add(operations)
-                .is_none_or(|total| total > limits.max_total_operations);
+        eyre::ensure!(
+            !block.block_rlp.is_empty() && block_rlp_bytes <= limits.max_block_rlp_bytes,
+            "block {} canonical RLP has {block_rlp_bytes} bytes, maximum is {}",
+            block.block.identity.number,
+            limits.max_block_rlp_bytes
+        );
+        let encoded_added_bytes = encoded_added_block_len(&block)?;
+        let candidate_count = current
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| eyre::eyre!("forward block count overflow"))?;
+        let candidate_operations = current_operations
+            .checked_add(operations)
+            .ok_or_else(|| eyre::eyre!("forward operation count overflow"))?;
+        let candidate_block_rlp_bytes = current_block_rlp_bytes
+            .checked_add(block_rlp_bytes)
+            .ok_or_else(|| eyre::eyre!("forward canonical block RLP byte count overflow"))?;
+        let candidate_encoded_added_bytes = current_encoded_added_bytes
+            .checked_add(encoded_added_bytes)
+            .ok_or_else(|| eyre::eyre!("forward encoded added-block byte count overflow"))?;
+        let candidate_frame_bytes = encoded_forward_frame_len(
+            stream,
+            &current_old_tip,
+            &block.block,
+            candidate_count,
+            candidate_encoded_added_bytes,
+        )?;
+        let would_exceed = candidate_count > limits.max_added_blocks ||
+            candidate_operations > limits.max_total_operations ||
+            candidate_block_rlp_bytes > limits.max_total_block_rlp_bytes ||
+            candidate_frame_bytes > limits.max_frame_bytes;
         if would_exceed && !current.is_empty() {
+            current_old_tip =
+                current.last().expect("non-empty forward chunk has a final block").block.clone();
             chunks.push(std::mem::take(&mut current));
             current_operations = 0;
+            current_block_rlp_bytes = 0;
+            current_encoded_added_bytes = 0;
         }
         current_operations = current_operations
             .checked_add(operations)
@@ -197,6 +247,35 @@ fn split_forward(added: Vec<AddedBlock>) -> eyre::Result<Vec<Vec<AddedBlock>>> {
             current_operations <= limits.max_total_operations,
             "block {} cannot fit in one atomic transition frame",
             block.block.identity.number
+        );
+        current_block_rlp_bytes = current_block_rlp_bytes
+            .checked_add(block_rlp_bytes)
+            .ok_or_else(|| eyre::eyre!("forward canonical block RLP byte count overflow"))?;
+        eyre::ensure!(
+            current_block_rlp_bytes <= limits.max_total_block_rlp_bytes,
+            "block {} cannot fit in one atomic transition RLP budget",
+            block.block.identity.number
+        );
+        current_encoded_added_bytes = current_encoded_added_bytes
+            .checked_add(encoded_added_bytes)
+            .ok_or_else(|| eyre::eyre!("forward encoded added-block byte count overflow"))?;
+        eyre::ensure!(
+            current.len() < limits.max_added_blocks,
+            "block {} cannot fit in one atomic transition block-count budget",
+            block.block.identity.number
+        );
+        let frame_bytes = encoded_forward_frame_len(
+            stream,
+            &current_old_tip,
+            &block.block,
+            current.len() + 1,
+            current_encoded_added_bytes,
+        )?;
+        eyre::ensure!(
+            frame_bytes <= limits.max_frame_bytes,
+            "block {} cannot fit in one atomic transition frame: {frame_bytes} bytes exceeds {}",
+            block.block.identity.number,
+            limits.max_frame_bytes
         );
         current.push(block);
     }
@@ -289,6 +368,57 @@ fn timeout_from_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tip_state_wire::{BlockExecutionContext, BlockIdentity, CanonicalBlockRlp, ExecutionFork};
+
+    fn test_descriptor(number: u64, tag: u8, parent_hash: [u8; 32]) -> BlockDescriptor {
+        BlockDescriptor {
+            identity: BlockIdentity {
+                number,
+                hash: [tag; 32],
+                parent_hash,
+                state_root: [tag.wrapping_add(64); 32],
+            },
+            execution: BlockExecutionContext {
+                active_fork: ExecutionFork::Frontier,
+                timestamp: number,
+                slot_number: None,
+                fee_recipient: [tag; 20],
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                base_fee_per_gas: [0; 32],
+                prev_randao: [tag.wrapping_add(1); 32],
+                difficulty: [0; 32],
+                blob_gas_used: None,
+                excess_blob_gas: None,
+                blob_base_fee: None,
+                parent_beacon_block_root: None,
+                withdrawals_root: None,
+                requests_hash: None,
+            },
+        }
+    }
+
+    fn forward_fixture() -> (StreamIdentity, BlockDescriptor, Vec<AddedBlock>) {
+        let seed_anchor = test_descriptor(1, 1, [9; 32]);
+        let first = test_descriptor(2, 2, seed_anchor.identity.hash);
+        let second = test_descriptor(3, 3, first.identity.hash);
+        let stream = StreamIdentity {
+            chain_id: 1,
+            genesis_hash: [9; 32],
+            seed_generation_id: [10; 32],
+            seed_sequence: 0,
+            seed_anchor: seed_anchor.clone(),
+        };
+        let added = [first, second]
+            .into_iter()
+            .map(|block| AddedBlock {
+                block,
+                block_rlp: CanonicalBlockRlp::new(vec![0xc0; 32]),
+                changes: Vec::new(),
+            })
+            .collect();
+        (stream, seed_anchor, added)
+    }
 
     #[test]
     fn bootstrap_and_live_timeout_defaults_are_independent() {
@@ -318,5 +448,49 @@ mod tests {
             30
         )
         .is_err());
+    }
+
+    #[test]
+    fn forward_combined_frame_overflow_splits_at_a_block_boundary() {
+        let (stream, old_tip, added) = forward_fixture();
+        let first_len = encoded_added_block_len(&added[0]).unwrap();
+        let second_len = encoded_added_block_len(&added[1]).unwrap();
+        let first_frame =
+            encoded_forward_frame_len(&stream, &old_tip, &added[0].block, 1, first_len).unwrap();
+        let second_frame =
+            encoded_forward_frame_len(&stream, &added[0].block, &added[1].block, 1, second_len)
+                .unwrap();
+        let combined_frame = encoded_forward_frame_len(
+            &stream,
+            &old_tip,
+            &added[1].block,
+            2,
+            first_len + second_len,
+        )
+        .unwrap();
+        let max_frame_bytes = first_frame.max(second_frame);
+        assert!(combined_frame > max_frame_bytes);
+
+        let limits = DecodeLimits { max_frame_bytes, ..DecodeLimits::default() };
+        let chunks = split_forward_with_limits(added, &stream, &old_tip, &limits).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1);
+        assert_eq!(chunks[1].len(), 1);
+        assert_eq!(chunks[0][0].block.identity.number, 2);
+        assert_eq!(chunks[1][0].block.identity.number, 3);
+    }
+
+    #[test]
+    fn single_forward_block_larger_than_frame_limit_fails_closed() {
+        let (stream, old_tip, mut added) = forward_fixture();
+        added.truncate(1);
+        let encoded_added_bytes = encoded_added_block_len(&added[0]).unwrap();
+        let frame_bytes =
+            encoded_forward_frame_len(&stream, &old_tip, &added[0].block, 1, encoded_added_bytes)
+                .unwrap();
+        let limits = DecodeLimits { max_frame_bytes: frame_bytes - 1, ..DecodeLimits::default() };
+
+        let error = split_forward_with_limits(added, &stream, &old_tip, &limits).unwrap_err();
+        assert!(error.to_string().contains("cannot fit in one atomic transition frame"));
     }
 }

@@ -12,17 +12,20 @@ workspace = true
 alloy-consensus = { workspace = true, features = ["std"] }
 alloy-eips = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["std"] }
+alloy-rlp.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
 reth-ethereum-primitives = { workspace = true, features = ["std"] }
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api = { workspace = true }
+reth-consensus-common = { workspace = true }
 reth-ethereum = { workspace = true, features = ["full", "cli"] }
 reth-evm = { workspace = true, features = ["std"] }
 reth-evm-ethereum = { workspace = true, features = ["std"] }
 reth-execution-types = { workspace = true, features = ["std"] }
 reth-provider = { workspace = true }
 reth-primitives-traits = { workspace = true, features = ["std"] }
+reth-stages-types = { workspace = true }
 reth-storage-api = { workspace = true }
 reth-trie-common = { workspace = true, features = ["std"] }
 revm = { workspace = true, features = ["std"] }

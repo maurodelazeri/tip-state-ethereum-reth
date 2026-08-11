@@ -3833,8 +3833,10 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
+ "alloy-rlp",
  "eyre",
  "futures-util",
+ "reth-consensus-common",
  "reth-db",
  "reth-db-api",
  "reth-ethereum",
@@ -3844,6 +3846,7 @@ dependencies = [
  "reth-execution-types",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-stages-types",
  "reth-storage-api",
  "reth-trie-common",
  "revm",
@@ -12258,7 +12261,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tip-state-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "serde",

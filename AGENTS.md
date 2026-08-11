@@ -10,16 +10,23 @@
   their required workspace/lockfile entries and the narrow fail-closed canonical-notification
   handling in `crates/node/builder/src/launch/exex.rs`. `Dockerfile.tip-state` is the only producer
   image recipe; the generic upstream Dockerfile does not build the custom executable.
-- Active identities are bootstrap schema 1 and `TIPWIRE1`. The downstream proxy translates the
-  producer bootstrap into `TIPSEED2` and the mandatory control protocol.
-- The awaited ExEx initializer must gate canonical progression until one pinned storage-v2 scan is
-  validated and acknowledged by every mandatory sink.
+- Active identities are bootstrap schema 2 and `TIPWIRE2`. Bootstrap2 and every TIPWIRE2 added
+  block carry bounded canonical full-block RLP. The downstream proxy translates bootstrap into
+  unchanged `TIPSEED2` and the unchanged mandatory `TIPCTRL1` control protocol.
+- Before scanning, the awaited ExEx initializer must verify in one read-only snapshot that
+  `Finish`, `Execution`, `AccountHashing`, `StorageHashing`, and `MerkleExecute` all exist and are
+  exactly equal to the launch head. It must then gate canonical progression until that pinned
+  storage-v2 scan is validated and acknowledged by every mandatory sink.
 - A mandatory outbox write, publish, sink, checksum, sequence, ancestry, or rollback failure is
   fatal. Never degrade to best-effort delivery.
 - The retained seed `BLOCKHASH` window is required for bounded post-seed reorg reconstruction.
   Crossing the seed anchor or retained history floor remains a full-reseed condition.
 - Do not add an RPC, provider, MDBX, trie, history, or cache-miss fallback to the replica serving
   path. Reth is a producer and external correctness oracle only.
+- The paired runtime's 14th method is current-tip-only `eth_getBlockByNumber`. Every syntactically
+  valid selector is normalized by the runtime to its one request-pinned generation; complete block
+  responses must come only from the transported canonical RLP, with no historical lookup or
+  request-path producer access.
 - Never run an unplanned writer or long-lived reader against `/mnt/blockchain/snapshot/reth`.
 - Keep custom changes narrow. Do not expand the wire, artifact, or method surface without an
   explicit request and exact qualification.
