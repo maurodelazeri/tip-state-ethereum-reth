@@ -69,7 +69,7 @@ same commit in the executable. The OCI labels record the same identities:
 test -z "$(git status --porcelain)"
 TIP_PRODUCER_COMMIT="$(git rev-parse HEAD)"
 TIP_PRODUCER_TREE="$(git rev-parse 'HEAD^{tree}')"
-TIP_IMAGE="tip-state-reth:${TIP_PRODUCER_COMMIT}"
+TIP_IMAGE="tip-state-ethereum-reth:${TIP_PRODUCER_COMMIT}"
 
 docker buildx build --load --pull \
   --file Dockerfile.tip-state \
