@@ -36,8 +36,9 @@ Its functional tree is `372864c03601f1dce408cf1b7544d06020ed3776`.
 - `crates/tip-state-wire/`
 - Their required workspace and lockfile entries
 - Narrow fail-closed handling in `crates/node/builder/src/launch/exex.rs`
-- `Dockerfile.tip-state`, the fork-owned image recipe that builds the custom producer executable
-  rather than the upstream `reth` binary
+- `Dockerfile.tip-state` and `Dockerfile.tip-state.dockerignore`, the fork-owned image recipe and
+  exact build-context policy that build the custom producer executable rather than the upstream
+  `reth` binary
 
 Current producer identities are bootstrap schema 1 and `TIPWIRE1`. Keep upstream source outside
 this boundary unchanged unless an explicit producer requirement makes a narrow change necessary.
