@@ -8,7 +8,8 @@
   producer change explicitly requires it.
 - Custom producer code lives under `examples/tip-state-exex/` and `crates/tip-state-wire/`, plus
   their required workspace/lockfile entries and the narrow fail-closed canonical-notification
-  handling in `crates/node/builder/src/launch/exex.rs`.
+  handling in `crates/node/builder/src/launch/exex.rs`. `Dockerfile.tip-state` is the only producer
+  image recipe; the generic upstream Dockerfile does not build the custom executable.
 - Active identities are bootstrap schema 1 and `TIPWIRE1`. The downstream proxy translates the
   producer bootstrap into `TIPSEED2` and the mandatory control protocol.
 - The awaited ExEx initializer must gate canonical progression until one pinned storage-v2 scan is

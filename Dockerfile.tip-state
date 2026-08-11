@@ -1,0 +1,72 @@
+# syntax=docker.io/docker/dockerfile:1.7-labs
+
+# Verified multi-platform index digests captured for the qualified linux/amd64 build inputs.
+ARG CARGO_CHEF_IMAGE=lukemathwalker/cargo-chef:latest-rust-1.93@sha256:a5dba3bcdb078c5e7697bbbc89d0ff8f6685c9720f7248299849249baea94673
+ARG RUNTIME_IMAGE=ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
+
+FROM ${CARGO_CHEF_IMAGE} AS chef
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y libclang-dev pkg-config
+
+FROM chef AS planner
+COPY --exclude=.git --exclude=dist . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+
+ARG BUILD_PROFILE=maxperf
+ENV BUILD_PROFILE=$BUILD_PROFILE
+
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS=$RUSTFLAGS
+
+# Cook the workspace dependency graph using the same profile as the final producer build.
+RUN cargo chef cook --profile "$BUILD_PROFILE" --recipe-path recipe.json
+
+ARG TARGETPLATFORM
+ARG PRODUCER_COMMIT
+ARG PRODUCER_TREE
+COPY --exclude=.git --exclude=dist . .
+RUN test -n "$PRODUCER_COMMIT" && test -n "$PRODUCER_TREE" && \
+    if [ -n "$RUSTFLAGS" ]; then \
+        export RUSTFLAGS="$RUSTFLAGS"; \
+    elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+        export RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"; \
+    fi && \
+    cargo build \
+        --profile "$BUILD_PROFILE" \
+        --locked \
+        --package example-tip-state-exex \
+        --bin example-tip-state-exex
+
+RUN install -D -m 0755 \
+    "/app/target/$BUILD_PROFILE/example-tip-state-exex" \
+    /out/reth-tip-state
+
+FROM ${RUNTIME_IMAGE} AS runtime
+WORKDIR /app
+
+ARG PRODUCER_COMMIT
+ARG PRODUCER_TREE
+ARG CARGO_CHEF_IMAGE
+ARG RUNTIME_IMAGE
+ARG BUILD_PROFILE=maxperf
+LABEL org.opencontainers.image.source="https://github.com/maurodelazeri/tip-state-ethereum-reth" \
+      org.opencontainers.image.revision="$PRODUCER_COMMIT" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      io.tipstate.ethereum.producer.binary="example-tip-state-exex" \
+      io.tipstate.ethereum.producer.tree="$PRODUCER_TREE" \
+      io.tipstate.ethereum.producer.build-profile="$BUILD_PROFILE" \
+      io.tipstate.ethereum.producer.build-image="$CARGO_CHEF_IMAGE" \
+      io.tipstate.ethereum.producer.runtime-image="$RUNTIME_IMAGE" \
+      io.tipstate.ethereum.upstream.repository="https://github.com/paradigmxyz/reth.git" \
+      io.tipstate.ethereum.upstream.release="v2.3.0" \
+      io.tipstate.ethereum.upstream.commit="9384bc53d8c0c77e59cac83fdaaf3b372c6d2216" \
+      io.tipstate.ethereum.upstream.tree="fd24663d6d1f39e082091121ec20cdac3adc83e3"
+COPY --from=builder /out/reth-tip-state /usr/local/bin/reth-tip-state
+COPY LICENSE-* ./
+
+EXPOSE 30303 30303/udp 9001 8545 8546
+ENTRYPOINT ["/usr/local/bin/reth-tip-state"]
