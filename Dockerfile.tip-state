@@ -28,8 +28,13 @@ RUN cargo chef cook --profile "$BUILD_PROFILE" --recipe-path recipe.json
 ARG TARGETPLATFORM
 ARG PRODUCER_COMMIT
 ARG PRODUCER_TREE
-COPY --exclude=.git --exclude=dist . .
+# Vergen reads the clean checkout metadata during this final compile. The planner does not need
+# `.git`, but excluding it here would embed VERGEN_IDEMPOTENT_OUTPUT instead of the source commit.
+COPY --exclude=dist . .
 RUN test -n "$PRODUCER_COMMIT" && test -n "$PRODUCER_TREE" && \
+    test "$(git rev-parse HEAD)" = "$PRODUCER_COMMIT" && \
+    test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCER_TREE" && \
+    test -z "$(git status --porcelain)" && \
     if [ -n "$RUSTFLAGS" ]; then \
         export RUSTFLAGS="$RUSTFLAGS"; \
     elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
