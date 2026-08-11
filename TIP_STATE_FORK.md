@@ -59,9 +59,10 @@ For a future rebuild or another architecture, re-resolve and verify the platform
 manifests instead of silently following either human-readable tag. Retain the exact input
 references with the final image ID, executable SHA-256, producer commit, and producer tree.
 
-Build only from a clean intended producer commit. The Docker build context excludes `.git`, so the
-required commit and tree arguments become explicit OCI labels rather than being inferred inside
-the image:
+Build only from a clean intended producer commit. `Dockerfile.tip-state.dockerignore` excludes only
+build output; the final builder receives the complete clean checkout and `.git` metadata. The build
+rejects a commit/tree argument that does not exactly match that checkout, and Vergen embeds the
+same commit in the executable. The OCI labels record the same identities:
 
 ```bash
 test -z "$(git status --porcelain)"
