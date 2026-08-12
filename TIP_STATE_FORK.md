@@ -11,7 +11,8 @@ the canonical seed and ordered live stream; it is not part of the runtime servin
 - Upstream release and workspace version: `v2.3.0`
 - Fork-point commit: `9384bc53d8c0c77e59cac83fdaaf3b372c6d2216`
 - Fork-point tree: `fd24663d6d1f39e082091121ec20cdac3adc83e3`
-- Annotated base tag: `tipstate-upstream-reth-v2.3.0`
+- Annotated base tag: `tipstate-upstream-reth-v2.3.0`; tag object
+  `56b185ad67941a1a84fa50c8fec5593122a38487`
 - Local paired runtime: sibling `../runtime`
 
 The exact fork point must be recorded explicitly. Never infer it only from a crate version or a
@@ -25,12 +26,24 @@ moving upstream branch.
    window required for bounded reorg reconstruction.
 3. `710307bc13c1fb6f3c9cace5af3ec7d55265bf5d` centralizes producer documentation and
    comments without changing functional behavior.
+4. `16e1c749b7e4dc4bc23279fc5114a105e2b0cdab` and
+   `f08c392d6085dfe916f2c5a4f173a67e7e88f6a7` record exact fork provenance and the
+   chain-qualified repository names.
+5. `1e60bb69e7267f04bfffa1b385f6d95bbb67e386` through
+   `3c0c2cf6c0fc10e774c3557bce645d370a4a688f` add, harden, and document the
+   fork-owned immutable producer-image path.
+6. `fa9439ad87d287dcf7acad05bc4be452be207476` adds canonical full-block transport,
+   bootstrap schema 2, `TIPWIRE2`, exact forward-frame sizing, and the five-frontier
+   state-snapshot guard required by current-tip `eth_getBlockByNumber`.
 
 The pre-bootstrap2 behavioral patch range was
 `9384bc53d8c0c77e59cac83fdaaf3b372c6d2216..5988f9f709daa9415c08afbec333d818ffaae37f`.
-Its functional tree was `372864c03601f1dce408cf1b7544d06020ed3776`. The current source additionally
-implements bootstrap2/TIPWIRE2 canonical full-block transport for method 14; record the resulting
-commit and tree with the paired runtime before qualification.
+Its functional tree was `372864c03601f1dce408cf1b7544d06020ed3776`. The qualified Bootstrap2/TIPWIRE2
+code range is
+`9384bc53d8c0c77e59cac83fdaaf3b372c6d2216..fa9439ad87d287dcf7acad05bc4be452be207476`;
+the qualified producer tree is `31ea0a8dee4bf34516d04d7afa91279c8b740c5f`. Later documentation-only commits
+must be recorded separately and must never be substituted for the image input: Vergen embeds the
+build commit in the executable.
 
 ## Custom source boundary
 
@@ -45,6 +58,20 @@ commit and tree with the paired runtime before qualification.
 Current producer identities are bootstrap schema 2 and `TIPWIRE2`. Keep upstream source outside
 this boundary unchanged unless an explicit producer requirement makes a narrow change necessary.
 
+The complete tracked delta from the official fork point through the current producer is limited
+to the following paths. Do not broaden it without an explicit product change:
+
+- `crates/node/builder/src/launch/exex.rs`: awaited/fail-closed ExEx integration only;
+- `crates/tip-state-wire/{Cargo.toml,src/bootstrap.rs,src/lib.rs}`: bootstrap and transition
+  wire identities, limits, checksums, and exact size accounting;
+- `examples/tip-state-exex/{Cargo.toml,src/coordinator.rs,src/lib.rs,src/main.rs,
+  src/producer_io.rs,src/seed_source.rs,src/wire.rs}`: producer capture, seed, outbox,
+  notification normalization, and mandatory delivery;
+- root `Cargo.toml` and `Cargo.lock`: only the workspace/dependency entries required by those
+  custom crates;
+- `Dockerfile.tip-state` and `Dockerfile.tip-state.dockerignore`: custom image build boundary;
+- `AGENTS.md` and this provenance record.
+
 ## Bootstrap2 and TIPWIRE2 block contract
 
 The producer transports the complete canonical Ethereum block RLP so replicas can answer
@@ -52,7 +79,7 @@ current-tip `eth_getBlockByNumber` without Reth, MDBX, history, or another netwo
 request path:
 
 - `SeedRequest.anchor_block_rlp` is the exact persisted anchor block encoded from the same
-  read-only MDBX transaction used for the Finish checkpoint, sealed header, snapshot transaction
+  read-only MDBX transaction used for the Finish checkpoint, canonical header, snapshot transaction
   ID, and `BLOCKHASH` window. Bootstrap JSON encodes it as lowercase, even-length, `0x`-prefixed
   hex.
 - Before reading that anchor or scanning state, the producer reads `Finish`, `Execution`,
@@ -103,7 +130,14 @@ references with the final image ID, executable SHA-256, producer commit, and pro
 Build only from a clean intended producer commit. `Dockerfile.tip-state.dockerignore` excludes only
 build output; the final builder receives the complete clean checkout and `.git` metadata. The build
 rejects a commit/tree argument that does not exactly match that checkout, and Vergen embeds the
-same commit in the executable. The OCI labels record the same identities:
+same commit in the executable. The OCI labels record the same identities. This is a source-pinned
+candidate build, not a promise of bit-for-bit image reproduction: the Dockerfile frontend
+`docker/dockerfile:1.7-labs` is not digest-pinned and the builder installs live apt packages. Exact
+bytes therefore require a pullable repository digest or a checksummed OCI/Docker archive. A newly
+built candidate must repeat the complete seed, RPC, readiness, and load validation before routing.
+
+The qualified image is linux/amd64. Always declare that platform rather than inheriting the build
+host default:
 
 ```bash
 test -z "$(git status --porcelain)"
@@ -112,6 +146,7 @@ TIP_PRODUCER_TREE="$(git rev-parse 'HEAD^{tree}')"
 TIP_IMAGE="tip-state-ethereum-reth:${TIP_PRODUCER_COMMIT}"
 
 docker buildx build --load --pull \
+  --platform linux/amd64 \
   --file Dockerfile.tip-state \
   --build-arg PRODUCER_COMMIT="$TIP_PRODUCER_COMMIT" \
   --build-arg PRODUCER_TREE="$TIP_PRODUCER_TREE" \
@@ -128,6 +163,46 @@ docker run --rm --entrypoint /usr/local/bin/reth-tip-state "$TIP_IMAGE" --versio
 docker run --rm --entrypoint /usr/bin/sha256sum \
   "$TIP_IMAGE" /usr/local/bin/reth-tip-state
 ```
+
+Before building an image, qualify the custom source boundary from the clean producer commit. The
+full-dependency nightly Clippy run currently reaches unrelated upstream `reth-era` lints, so the
+strict fork-owned gate deliberately uses `--no-deps` after the locked all-target test:
+
+```bash
+cargo +nightly-2026-08-03 fmt --package tip-state-wire --package example-tip-state-exex -- --check
+cargo +1.97.1 test --locked --release --all-targets \
+  --package tip-state-wire --package example-tip-state-exex
+cargo +nightly-2026-08-03 clippy --locked --release --all-targets --all-features --no-deps \
+  --package tip-state-wire --package example-tip-state-exex -- -D warnings
+cargo +1.97.1 build --locked --release --package tip-state-wire
+cargo +1.97.1 build --locked --release --package example-tip-state-exex \
+  --bin example-tip-state-exex
+git diff --check
+```
+
+### Qualified immutable deployment
+
+The first live-qualified Bootstrap2/TIPWIRE2 artifact ledger is exact:
+
+| Binding | Qualified value |
+| --- | --- |
+| Producer build commit | `fa9439ad87d287dcf7acad05bc4be452be207476` |
+| Producer build tree | `31ea0a8dee4bf34516d04d7afa91279c8b740c5f` |
+| Paired runtime code commit | `de223ff777c652de0c76ce3678d1977a07e4a0de` |
+| Paired runtime code tree | `70ef75c6f582ad0f0f820d9f572bad78dff36cc5` |
+| Local image tag | `tip-state-ethereum-reth:fa9439ad87d287dcf7acad05bc4be452be207476` |
+| Local image ID | `sha256:ab080d08d0b9ecd708e729881fc393eb4bd017772e4051b10251c49317d31c24` |
+| Local RepoDigest metadata | `tip-state-ethereum-reth@sha256:ab080d08d0b9ecd708e729881fc393eb4bd017772e4051b10251c49317d31c24`; not a pullable registry guarantee |
+| Installed entrypoint | `/usr/local/bin/reth-tip-state` |
+| Entrypoint SHA-256 | `25dd42da5bb20ec36397fb1bd51737f8f3134a4bb5a95a0aec0a6fb9d03328a3` |
+| Entrypoint size | `65,482,016` bytes |
+| Embedded version/profile | commit `fa9439ad87d287dcf7acad05bc4be452be207476`; `maxperf` |
+| Builder image | `lukemathwalker/cargo-chef:latest-rust-1.93@sha256:a5dba3bcdb078c5e7697bbbc89d0ff8f6685c9720f7248299849249baea94673` |
+| Runtime image | `ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea` |
+
+Epoch 13 completed the first live three-replica validation for this immutable artifact. For
+total-host recovery, restore the exact image from a registry or checksummed archive, then verify
+the image ID, labels, entrypoint bytes, and version before container creation.
 
 The paired runtime owns the exact container, host-mount, systemd, and cohort configuration. The
 producer's required in-container values are explicit and non-secret:
@@ -155,19 +230,35 @@ The proxy and every stateful replica must also use `Restart=no`: any process los
 in-memory cohort and requires a fresh membership epoch and complete reseed, never a same-epoch
 automatic retry.
 
-### Existing qualified-container warning
+### Historical writable-layer artifact
 
-The currently qualified executable SHA-256
-`d4b8d110d113f26a75df663486289c15d5e1e734c3c1404b96169353c9016b1d` is present in the existing
-`reth` container's writable layer, not in its underlying image
-`sha256:d9afe810e4a630f879911f5ae3e72a15339587dfa986497bd2fd424c7f29fb26`
-(`reth-local:rpc-cache-020c6ab5dfb2`). The executable embeds Git SHA
-`c79e896158410b587ecfe4c73a6a24787dcee52a`, which is not present in this canonical repository;
-the checked-in generic Dockerfile also builds the ordinary `reth` binary. Treat that existing
-container as a preserved recovery artifact: do not remove or recreate it during recovery. A new
-image built from `Dockerfile.tip-state` may replace it only after its exact commit, tree, base-image
-digests, image ID, executable hash, full empty-state reseed, oracle comparison, and coordinated
-restart qualification have all been recorded.
+Epochs 9 and 10 used executable SHA-256
+`d4b8d110d113f26a75df663486289c15d5e1e734c3c1404b96169353c9016b1d`, copied into the writable
+layer of a container based on
+`sha256:d9afe810e4a630f879911f5ae3e72a15339587dfa986497bd2fd424c7f29fb26`. It embedded untracked Git
+identity `c79e896158410b587ecfe4c73a6a24787dcee52a`. That stopped container is historical only; it is
+not the current producer, a build input, or a disaster-recovery path. The immutable artifact above
+replaced it after a full empty-state seed, Reth comparison, and public validation. Epoch 14 was an
+incomplete attempt and must not be resumed. Use a new common epoch for the next cohort.
+
+### Ordinary Reth is a separate recovery tool
+
+The custom image always installs `example-tip-state-exex`. A fresh Ethereum data rebuild must not
+use that awaited ExEx while the execution database is still synchronizing from empty. Build the
+ordinary non-ExEx node from the exact qualified fork commit instead:
+
+```bash
+cargo +1.97.1 build --locked --release --package reth --bin reth
+```
+
+Run that ordinary binary with the paired Lighthouse configuration until the execution database is
+fully synchronized, then stop both cleanly. Before a custom cohort starts, `Finish`, `Execution`,
+`AccountHashing`, `StorageHashing`, and `MerkleExecute` must all exist and equal one canonical
+launch head. The custom seed source reads and validates those five checkpoints from one read-only
+provider snapshot before connecting to a replica or scanning state; any mismatch is terminal and
+must be converged with the ordinary node, never repaired by replaying transitions into replicas.
+The paired runtime's disaster-recovery runbook owns the filesystem, JWT, Lighthouse, container,
+membership, and validation steps.
 
 ## Upgrade rule
 
